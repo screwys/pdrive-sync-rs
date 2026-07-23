@@ -15,8 +15,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            asset: x86_64-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            asset: aarch64-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -24,16 +26,13 @@ jobs:
       - run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Package
         run: |
-          archive="pdrive-sync-rs-${{ matrix.target }}.tar.gz"
+          archive="pdrive-sync-rs-${{ matrix.asset }}.tar.gz"
           cp "target/${{ matrix.target }}/release/pdrive-sync-rs" pdrive-sync-rs
           tar -czf "$archive" pdrive-sync-rs README.md LICENSE
-          sha256sum "$archive" > "$archive.sha256"
       - uses: actions/upload-artifact@v7
         with:
-          name: pdrive-sync-rs-${{ matrix.target }}
-          path: |
-            pdrive-sync-rs-${{ matrix.target }}.tar.gz
-            pdrive-sync-rs-${{ matrix.target }}.tar.gz.sha256
+          name: pdrive-sync-rs-${{ matrix.asset }}
+          path: pdrive-sync-rs-${{ matrix.asset }}.tar.gz
 
   publish:
     needs: build

@@ -9,21 +9,19 @@ temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
 
 case "$(uname -m)" in
-    x86_64) target="x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) target="aarch64-unknown-linux-gnu" ;;
+    x86_64) platform="x86_64-linux-gnu" ;;
+    aarch64 | arm64) platform="aarch64-linux-gnu" ;;
     *)
         printf 'pdrive-sync-rs: unsupported architecture: %s\n' "$(uname -m)" >&2
         exit 1
         ;;
 esac
 
-archive="pdrive-sync-rs-$target.tar.gz"
+archive="pdrive-sync-rs-$platform.tar.gz"
 release="https://github.com/$repository/releases/latest/download"
-if curl -fL "$release/$archive" -o "$temporary_dir/$archive" &&
-    curl -fL "$release/$archive.sha256" -o "$temporary_dir/$archive.sha256"; then
+if curl -fL "$release/$archive" -o "$temporary_dir/$archive"; then
     (
         cd "$temporary_dir"
-        sha256sum -c "$archive.sha256"
         tar -xzf "$archive"
     )
     install -d "$install_dir"
