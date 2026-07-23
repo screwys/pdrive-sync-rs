@@ -42,6 +42,16 @@ systemd, dinit, or OpenRC user service manager and creates
 `pdrive-sync.service`. Use `--interval 30m` to change the default one-hour
 interval.
 
+systemd uses a oneshot service and timer. dinit and OpenRC supervise the
+built-in interval loop from `~/.config/dinit.d/pdrive-sync` or
+`~/.config/rc/init.d/pdrive-sync`. Force detection when needed:
+
+```sh
+pdrive-sync-rs install --init dinit
+pdrive-sync-rs status --init dinit
+pdrive-sync-rs uninstall --init dinit
+```
+
 ## Configuration
 
 The default file is `~/.config/pdrive-sync/config.toml`:
