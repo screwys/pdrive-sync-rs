@@ -52,6 +52,11 @@ pdrive-sync-rs status --init dinit
 pdrive-sync-rs uninstall --init dinit
 ```
 
+The systemd unit also applies a soft `MemoryHigh=512M` cache-reclaim boundary.
+dinit can only join a cgroup created elsewhere, and OpenRC user services do not
+create cgroups, so the installer does not substitute an unsafe hard memory
+limit for those managers.
+
 ## Configuration
 
 The default file is `~/.config/pdrive-sync/config.toml`:
