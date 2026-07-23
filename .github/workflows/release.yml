@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          archive="pdrive-sync-rs-${{ matrix.target }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/pdrive-sync-rs" pdrive-sync-rs
+          tar -czf "$archive" pdrive-sync-rs README.md LICENSE
+          sha256sum "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdrive-sync-rs-${{ matrix.target }}
+          path: |
+            pdrive-sync-rs-${{ matrix.target }}.tar.gz
+            pdrive-sync-rs-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes ""

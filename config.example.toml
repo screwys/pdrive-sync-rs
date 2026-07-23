@@ -1,0 +1,32 @@
+# Use an absolute path here if proton-drive is not on PATH.
+proton_drive_bin = "proton-drive"
+
+# Local is authoritative. Deleted local files remain remote with "keep".
+[[sync]]
+name = "documents-push"
+mode = "push"
+local = "/home/me/Documents"
+remote = "/my-files/Documents"
+delete = "keep"
+# Patterns are relative to the local/remote root and use forward slashes.
+exclude = ["private/**", "*.tmp"]
+
+# Proton Drive is authoritative. The marker prevents an unavailable removable
+# disk from being interpreted as an empty destination.
+[[sync]]
+name = "photos-pull"
+mode = "pull"
+local = "/mnt/archive/Photos"
+remote = "/my-files/Photos"
+ready_marker = ".sync-ready"
+delete = "trash"
+
+# Changes propagate in either direction. A simultaneous change stops the whole
+# entry before any transfer; use local-wins or remote-wins only when intended.
+[[sync]]
+name = "notes-two-way"
+mode = "two-way"
+local = "/home/me/Notes"
+remote = "/my-files/Notes"
+delete = "trash"
+conflict = "fail"
