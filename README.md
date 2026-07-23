@@ -1,9 +1,7 @@
 # pdrive-sync-rs
 
-`pdrive-sync-rs` adds scheduled one-way and two-way folder sync to Proton
-Drive's official Linux CLI. It is a sync layer, not another Proton client: it
-does not implement authentication, store Proton credentials, or install the
-official CLI.
+`pdrive-sync-rs` is a simple and ligthweight way to orchestrate official CLI of proton-drive. It adds scheduled one-way and two-way folder sync layer, it is not another Proton client: it
+does not implement authentication, or store Proton credentials.
 
 It supports local-to-remote push, remote-to-local pull, and two-way sync.
 Deletion is opt-in: `delete = "trash"` moves removed files to Proton Drive
@@ -99,5 +97,5 @@ remote tree on each run because the CLI does not expose the SDK event stream.
 
 ## License
 
-Copyright © 2026 screwys. Licensed under the GNU General Public License,
+Licensed under the GNU General Public License,
 version 3 or any later version (`GPL-3.0-or-later`).
