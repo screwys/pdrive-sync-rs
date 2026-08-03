@@ -11,7 +11,7 @@ readme = "README.md"
 name = "pdrive_sync"
 
 [[bin]]
-name = "pdrive-sync-rs"
+name = "pdrive-sync"
 path = "src/main.rs"
 
 [dependencies]

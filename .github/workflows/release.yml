@@ -27,8 +27,8 @@ jobs:
       - name: Package
         run: |
           archive="pdrive-sync-rs-${{ matrix.asset }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/pdrive-sync-rs" pdrive-sync-rs
-          tar -czf "$archive" pdrive-sync-rs README.md LICENSE
+          cp "target/${{ matrix.target }}/release/pdrive-sync" pdrive-sync
+          tar -czf "$archive" pdrive-sync README.md LICENSE
       - uses: actions/upload-artifact@v7
         with:
           name: pdrive-sync-rs-${{ matrix.asset }}
@@ -48,4 +48,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*
           --repo "$GITHUB_REPOSITORY"
           --title "$GITHUB_REF_NAME"
-          --notes "Initial release of pdrive-sync-rs, a simple and ligthweight way to orchestrate official CLI of proton-drive"
+          --notes "Release of pdrive-sync, a lightweight sync layer for the official Proton Drive CLI"

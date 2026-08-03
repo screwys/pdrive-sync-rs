@@ -1,6 +1,6 @@
-# pdrive-sync-rs
+# pdrive-sync
 
-`pdrive-sync-rs` is a simple and ligthweight way to orchestrate official CLI of proton-drive. It adds scheduled one-way and two-way folder sync layer, it is not another Proton client: it
+`pdrive-sync` is a simple and lightweight way to orchestrate the official Proton Drive CLI. It adds a scheduled one-way and two-way folder sync layer; it is not another Proton client and
 does not implement authentication, or store Proton credentials.
 
 It supports local-to-remote push, remote-to-local pull, and two-way sync.
@@ -30,24 +30,24 @@ executable. Then install the sync wrapper:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/screwys/pdrive-sync-rs/main/install.sh | sh
-pdrive-sync-rs setup
-pdrive-sync-rs install
-pdrive-sync-rs status
 ```
 
-The installer puts `pdrive-sync-rs` in `~/.local/bin`. `install` detects a
-systemd, dinit, or OpenRC user service manager and creates
-`pdrive-sync.service`. Use `--interval 30m` to change the default one-hour
-interval.
+The installer puts `pdrive-sync` in `~/.local/bin`, opens the interactive
+configuration, and installs and starts `pdrive-sync.service`. It detects a
+systemd, dinit, or OpenRC user service manager automatically.
+
+Use `pdrive-sync restart` to restart the installed service, or
+`pdrive-sync update` to replace the current executable with the latest release.
 
 systemd uses a oneshot service and timer. dinit and OpenRC supervise the
 built-in interval loop from `~/.config/dinit.d/pdrive-sync` or
 `~/.config/rc/init.d/pdrive-sync`. Force detection when needed:
 
 ```sh
-pdrive-sync-rs install --init dinit
-pdrive-sync-rs status --init dinit
-pdrive-sync-rs uninstall --init dinit
+pdrive-sync install --init dinit
+pdrive-sync status --init dinit
+pdrive-sync restart --init dinit
+pdrive-sync uninstall --init dinit
 ```
 
 The systemd unit also applies a soft `MemoryHigh=512M` cache-reclaim boundary.
@@ -84,9 +84,9 @@ completed successfully for 24 hours. Repeated notifications are limited to
 once per 24 hours. Set `notifications = false` in the configuration to disable
 them for the service, or pass `sync --no-notifications` for one run.
 
-Run selected entries with `pdrive-sync-rs sync documents photos`, or describe a
+Run selected entries with `pdrive-sync sync documents photos`, or describe a
 safe one-off sync with `--local`, `--remote`, `--mode`, and `--delete`.
-`pdrive-sync-rs config validate` checks the file.
+`pdrive-sync config validate` checks the file.
 
 ## Behavior
 

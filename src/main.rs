@@ -11,6 +11,7 @@ use pdrive_sync::{
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 const STALE_SYNC_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_REPOSITORY: &str = "screwys/pdrive-sync-rs";
+const INSTALLER_SCRIPT: &str = include_str!("../install.sh");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,6 +46,10 @@ enum Command {
     Install(ServiceArgs),
     /// Show service state and the last successful run.
     Status(ServiceTarget),
+    /// Restart the user service.
+    Restart(ServiceTarget),
+    /// Replace this executable with the latest release.
+    Update,
     /// Stop and remove the user service. Configuration and state are preserved.
     Uninstall(ServiceTarget),
     /// Inspect or validate the configuration.
@@ -147,6 +154,8 @@ fn run() -> Result<()> {
         Command::Setup => setup(&config_path),
         Command::Install(args) => install_service(&config_path, args),
         Command::Status(target) => service_status(&config_path, target.init),
+        Command::Restart(target) => restart_service(target.init),
+        Command::Update => update_binary(),
         Command::Uninstall(target) => uninstall_service(target.init),
         Command::Daemon(args) => run_daemon(&config_path, args),
         Command::Config { command } => match command {
@@ -342,7 +351,6 @@ fn setup(config_path: &Path) -> Result<()> {
     fs::write(&temporary, contents)?;
     fs::rename(&temporary, config_path)?;
     println!("Wrote {}", config_path.display());
-    println!("Run `pdrive-sync config validate` before enabling a service.");
     Ok(())
 }
 
@@ -420,6 +428,55 @@ fn service_status(config_path: &Path, requested: InitSystem) -> Result<()> {
             "{} reported an inactive or failed service",
             init_system_name(init)
         );
+    }
+    Ok(())
+}
+
+fn restart_service(requested: InitSystem) -> Result<()> {
+    let init = resolve_init(requested)?;
+    let (program, args) = service_restart_command(init);
+    checked_command(program, args)?;
+    println!(
+        "Restarted pdrive-sync.service with {}.",
+        init_system_name(init)
+    );
+    Ok(())
+}
+
+fn service_restart_command(init: InitSystem) -> (&'static str, &'static [&'static str]) {
+    match init {
+        InitSystem::Systemd => ("systemctl", &["--user", "restart", "pdrive-sync.service"]),
+        InitSystem::Dinit => ("dinitctl", &["--user", "restart", "pdrive-sync"]),
+        InitSystem::Openrc => ("rc-service", &["--user", "pdrive-sync", "restart"]),
+        InitSystem::Auto => unreachable!(),
+    }
+}
+
+fn update_binary() -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
+    let install_dir = executable
+        .parent()
+        .context("the current executable has no parent directory")?;
+    let repository =
+        std::env::var("PDRIVE_SYNC_REPOSITORY").unwrap_or_else(|_| DEFAULT_REPOSITORY.to_owned());
+    let mut installer = ProcessCommand::new("sh")
+        .env("PDRIVE_SYNC_CURRENT_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("PDRIVE_SYNC_INSTALL_DIR", install_dir)
+        .env("PDRIVE_SYNC_REPOSITORY", &repository)
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to start the pdrive-sync installer")?;
+    installer
+        .stdin
+        .take()
+        .context("failed to open the pdrive-sync installer input")?
+        .write_all(INSTALLER_SCRIPT.as_bytes())
+        .context("failed to pass the pdrive-sync installer to the shell")?;
+    let install_status = installer
+        .wait()
+        .context("failed to wait for the pdrive-sync installer")?;
+    if !install_status.success() {
+        bail!("pdrive-sync installer exited with {install_status}");
     }
     Ok(())
 }
@@ -717,37 +774,68 @@ mod tests {
     #[test]
     fn management_commands_are_top_level() {
         assert!(matches!(
-            Cli::try_parse_from(["pdrive-sync-rs", "status"])
+            Cli::try_parse_from(["pdrive-sync", "status"])
                 .unwrap()
                 .command,
             Some(Command::Status(_))
         ));
         assert!(matches!(
-            Cli::try_parse_from(["pdrive-sync-rs", "install", "--interval", "30m"])
+            Cli::try_parse_from(["pdrive-sync", "install", "--interval", "30m"])
                 .unwrap()
                 .command,
             Some(Command::Install(ServiceArgs { interval, .. }))
                 if interval == Duration::from_secs(30 * 60)
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["pdrive-sync", "restart"])
+                .unwrap()
+                .command,
+            Some(Command::Restart(_))
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["pdrive-sync", "update"])
+                .unwrap()
+                .command,
+            Some(Command::Update)
+        ));
+    }
+
+    #[test]
+    fn restart_uses_each_user_service_manager() {
+        assert_eq!(
+            service_restart_command(InitSystem::Systemd),
+            (
+                "systemctl",
+                &["--user", "restart", "pdrive-sync.service"][..]
+            )
+        );
+        assert_eq!(
+            service_restart_command(InitSystem::Dinit),
+            ("dinitctl", &["--user", "restart", "pdrive-sync"][..])
+        );
+        assert_eq!(
+            service_restart_command(InitSystem::Openrc),
+            ("rc-service", &["--user", "pdrive-sync", "restart"][..])
+        );
     }
 
     #[test]
     fn generated_service_files_use_the_public_service_name() {
-        let binary = Path::new("/home/user name/.local/bin/pdrive-sync-rs");
+        let binary = Path::new("/home/user name/.local/bin/pdrive-sync");
         let config = Path::new("/home/user name/.config/pdrive-sync/config.toml");
         let (systemd_service, systemd_timer) =
             systemd_units(binary, config, Duration::from_secs(3600));
         let dinit = dinit_service(binary, config, Duration::from_secs(3600));
         let openrc = openrc_service(binary, config, Duration::from_secs(3600));
 
-        assert!(systemd_service.contains("pdrive-sync-rs"));
-        assert!(systemd_service.contains("\"/home/user name/.local/bin/pdrive-sync-rs\""));
+        assert!(systemd_service.contains("pdrive-sync"));
+        assert!(systemd_service.contains("\"/home/user name/.local/bin/pdrive-sync\""));
         assert!(systemd_service.contains("%h/.local/bin"));
         assert!(systemd_timer.contains("OnUnitInactiveSec=3600s"));
         assert!(systemd_service.contains("MemoryHigh=512M"));
-        assert!(dinit.contains("\"/home/user name/.local/bin/pdrive-sync-rs\""));
+        assert!(dinit.contains("\"/home/user name/.local/bin/pdrive-sync\""));
         assert!(dinit.contains("daemon"));
         assert!(openrc.contains("supervisor=supervise-daemon"));
-        assert!(openrc.contains("pdrive-sync-rs"));
+        assert!(openrc.contains("pdrive-sync"));
     }
 }
