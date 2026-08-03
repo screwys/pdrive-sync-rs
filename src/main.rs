@@ -16,7 +16,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+const STALE_SYNC_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,6 +74,9 @@ struct SyncArgs {
     /// Proton Drive CLI executable or absolute path.
     #[arg(long, default_value = "proton-drive")]
     proton_drive: PathBuf,
+    /// Do not send a desktop notification when no sync has succeeded for 24 hours.
+    #[arg(long)]
+    no_notifications: bool,
 }
 
 impl Default for SyncArgs {
@@ -84,6 +89,7 @@ impl Default for SyncArgs {
             delete: DeletePolicy::Keep,
             conflict: ConflictPolicy::Fail,
             proton_drive: PathBuf::from("proton-drive"),
+            no_notifications: false,
         }
     }
 }
@@ -163,11 +169,13 @@ fn run() -> Result<()> {
 }
 
 fn run_sync(config_path: &Path, args: SyncArgs) -> Result<()> {
+    let notifications_requested = !args.no_notifications;
     let config = if let (Some(local), Some(remote)) = (args.local, args.remote) {
         let name = one_off_name(&local, &remote, args.mode);
         Config {
             proton_drive_bin: args.proton_drive,
             optimize_cli_cache: true,
+            notifications: true,
             state_db: None,
             success_file: None,
             syncs: vec![SyncConfig {
@@ -209,8 +217,21 @@ fn run_sync(config_path: &Path, args: SyncArgs) -> Result<()> {
     let (database_path, success_path) = resolved_state_paths(&config)?;
     let connection = open_database(&database_path)?;
     let mut drive = CliDrive::new(config.proton_drive_bin.clone());
-    let summaries = sync_all(&config, &connection, &mut drive)
-        .with_context(|| format!("sync configured by {} failed", config_path.display()))?;
+    let summaries = match sync_all(&config, &connection, &mut drive) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            if let Err(notification_error) = notify_if_sync_is_stale(
+                &success_path,
+                config.notifications && notifications_requested,
+            ) {
+                eprintln!(
+                    "[pdrive-sync] WARNING: could not send stale-sync notification: {notification_error:#}"
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("sync configured by {} failed", config_path.display()));
+        }
+    };
 
     for (name, summary) in summaries {
         println!(
@@ -293,6 +314,7 @@ fn setup(config_path: &Path) -> Result<()> {
     let config = Config {
         proton_drive_bin: PathBuf::from(proton_drive_bin),
         optimize_cli_cache: true,
+        notifications: true,
         state_db: None,
         success_file: None,
         syncs: vec![SyncConfig {
@@ -547,6 +569,69 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
         return Err("duration must be greater than zero".to_owned());
     }
     Ok(duration)
+}
+
+fn notify_if_sync_is_stale(success_path: &Path, enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+
+    let notification_path = stale_notification_path(success_path);
+    let last_success = modified_if_present(success_path)?;
+    let last_notification = modified_if_present(&notification_path)?;
+    if !stale_notification_due(last_success, last_notification, SystemTime::now()) {
+        return Ok(());
+    }
+
+    let status = ProcessCommand::new("notify-send")
+        .args([
+            "--app-name=pdrive-sync",
+            "--urgency=critical",
+            "Proton Drive sync needs attention",
+            "No Proton Drive sync has completed successfully in the last 24 hours.",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .context("failed to run notify-send")?;
+    if !status.success() {
+        bail!("notify-send exited with {status}");
+    }
+
+    write_atomic(&notification_path, b"notification sent\n")
+        .context("failed to record stale-sync notification")
+}
+
+fn stale_notification_due(
+    last_success: Option<SystemTime>,
+    last_notification: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    last_success.is_none_or(|timestamp| {
+        now.duration_since(timestamp)
+            .is_ok_and(|elapsed| elapsed >= STALE_SYNC_AFTER)
+    }) && last_notification.is_none_or(|timestamp| {
+        now.duration_since(timestamp)
+            .is_ok_and(|elapsed| elapsed >= STALE_SYNC_AFTER)
+    })
+}
+
+fn stale_notification_path(success_path: &Path) -> PathBuf {
+    let mut name = success_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".stale-notification");
+    success_path.with_file_name(name)
+}
+
+fn modified_if_present(path: &Path) -> Result<Option<SystemTime>> {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata
+            .modified()
+            .map(Some)
+            .with_context(|| format!("failed to read modification time for {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect notification state at {}", path.display())),
+    }
 }
 
 fn command_succeeds(program: &str, args: &[&str]) -> bool {

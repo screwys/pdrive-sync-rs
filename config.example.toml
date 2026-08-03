@@ -1,6 +1,9 @@
 # Use an absolute path here if proton-drive is not on PATH.
 proton_drive_bin = "proton-drive"
 
+# A failed run sends a desktop notification after 24 hours without a success.
+notifications = true
+
 # Local is authoritative. Deleted local files remain remote with "keep".
 [[sync]]
 name = "documents-push"

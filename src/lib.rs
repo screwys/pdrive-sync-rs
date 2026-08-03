@@ -23,6 +23,8 @@ pub struct Config {
     pub proton_drive_bin: PathBuf,
     #[serde(default = "default_optimize_cli_cache")]
     pub optimize_cli_cache: bool,
+    #[serde(default = "default_notifications")]
+    pub notifications: bool,
     pub state_db: Option<PathBuf>,
     pub success_file: Option<PathBuf>,
     #[serde(rename = "sync")]
@@ -80,6 +82,10 @@ fn default_optimize_cli_cache() -> bool {
     true
 }
 
+fn default_notifications() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultValue<T> {
@@ -95,7 +101,7 @@ pub struct RemoteNode {
     #[serde(rename = "type")]
     pub kind: String,
     pub total_storage_size: Option<u64>,
-    pub active_revision: Option<ResultValue<RemoteRevision>>,
+    pub active_revision: Option<RemoteRevision>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1412,7 +1418,7 @@ fn remote_file(node: Option<RemoteNode>) -> Option<RemoteFile> {
     if node.kind != "file" {
         return None;
     }
-    let revision = node.active_revision?.value?;
+    let revision = node.active_revision?;
     Some(RemoteFile {
         sha1: revision.claimed_digests.sha1,
         claimed_size: revision.claimed_size,
@@ -1768,18 +1774,15 @@ mod tests {
                 },
                 kind: "file".to_string(),
                 total_storage_size: Some(file.claimed_size),
-                active_revision: Some(ResultValue {
-                    ok: true,
-                    value: Some(RemoteRevision {
-                        uid: format!("revision:{path}"),
-                        storage_size: file.claimed_size,
-                        claimed_size: file.claimed_size,
-                        claimed_modification_time: None,
-                        claimed_digests: RemoteDigests {
-                            sha1: file.sha1.clone(),
-                            sha1_verified: Some(true),
-                        },
-                    }),
+                active_revision: Some(RemoteRevision {
+                    uid: format!("revision:{path}"),
+                    storage_size: file.claimed_size,
+                    claimed_size: file.claimed_size,
+                    claimed_modification_time: None,
+                    claimed_digests: RemoteDigests {
+                        sha1: file.sha1.clone(),
+                        sha1_verified: Some(true),
+                    },
                 }),
             }
         }
@@ -2234,6 +2237,7 @@ mod tests {
         let config = Config {
             proton_drive_bin: PathBuf::from("proton-drive"),
             optimize_cli_cache: true,
+            notifications: true,
             state_db: None,
             success_file: None,
             syncs: vec![fixture.mirror],

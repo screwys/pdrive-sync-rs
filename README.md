@@ -79,6 +79,11 @@ mistaken for an empty folder. See
 `exclude = ["private/**", "*.tmp"]` leaves matching paths untouched on both
 sides, including when deletion is enabled.
 
+After a failed attempt, a desktop notification is sent when no sync has
+completed successfully for 24 hours. Repeated notifications are limited to
+once per 24 hours. Set `notifications = false` in the configuration to disable
+them for the service, or pass `sync --no-notifications` for one run.
+
 Run selected entries with `pdrive-sync-rs sync documents photos`, or describe a
 safe one-off sync with `--local`, `--remote`, `--mode`, and `--delete`.
 `pdrive-sync-rs config validate` checks the file.
