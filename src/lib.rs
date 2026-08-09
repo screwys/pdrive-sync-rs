@@ -274,7 +274,7 @@ impl DriveClient for CliDrive {
         ])?;
         let summary: TransferSummary =
             serde_json::from_slice(&output).context("invalid JSON from Proton Drive upload")?;
-        if summary.failed_items != 0 || summary.transferred_items != 1 {
+        if summary.failed_items != 0 || summary.transferred_items > 1 {
             bail!(
                 "Proton Drive upload reported transferred={} failed={}",
                 summary.transferred_items,
@@ -1220,7 +1220,9 @@ fn upload_changed_file(
 ) -> Result<()> {
     let parent = relative_parent(&local.relative);
     ensure_remote_directory(mirror, connection, drive, parent)?;
-    drive.upload(&local.absolute, &remote_path(&mirror.remote, parent))
+    drive
+        .upload(&local.absolute, &remote_path(&mirror.remote, parent))
+        .with_context(|| format!("failed to upload {}", local.relative))
 }
 
 fn require_ready(mirror: &SyncConfig) -> Result<()> {
