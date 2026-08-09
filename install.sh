@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 set -eu
 
 repository="${PDRIVE_SYNC_REPOSITORY:-screwys/pdrive-sync-rs}"

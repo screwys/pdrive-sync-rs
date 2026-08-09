@@ -48,4 +48,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*
           --repo "$GITHUB_REPOSITORY"
           --title "$GITHUB_REF_NAME"
-          --notes "Release of pdrive-sync, a lightweight sync layer for the official Proton Drive CLI"
+          --notes-from-tag

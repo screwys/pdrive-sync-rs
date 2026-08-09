@@ -1,21 +1,37 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
+
+mod drive;
+mod state;
+
+pub use drive::{
+    CliDrive, DriveClient, RemoteDigests, RemoteFile, RemoteNode, RemoteRevision, ResultValue,
+    TrashBatchResult, TrashTarget, UploadBatchResult, UploadFailure, optimize_cli_cache,
+    optimize_cli_cache_dir,
+};
+#[cfg(test)]
+use drive::{quote_repl_argument, reject_repl_newlines};
+#[cfg(test)]
+use state::CHECKPOINT_BATCH_SIZE;
+use state::{
+    CheckpointBatch, FileState, all_file_states, delete_file_state, file_state, metadata_value,
+    remote_directory_known, replace_remote_directories, save_remote_directory, set_metadata,
+    stale_paths,
+};
+pub use state::{default_state_dir, open_database, write_success_file};
 
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-const CHECKPOINT_BATCH_SIZE: usize = 256;
+const UPLOAD_BATCH_SIZE: usize = 32;
+const TRASH_BATCH_SIZE: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -86,417 +102,6 @@ fn default_notifications() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResultValue<T> {
-    pub ok: bool,
-    pub value: Option<T>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteNode {
-    pub uid: String,
-    pub name: ResultValue<String>,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub total_storage_size: Option<u64>,
-    pub active_revision: Option<RemoteRevision>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteRevision {
-    pub uid: String,
-    pub storage_size: u64,
-    pub claimed_size: u64,
-    pub claimed_modification_time: Option<String>,
-    pub claimed_digests: RemoteDigests,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteDigests {
-    pub sha1: String,
-    pub sha1_verified: Option<bool>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RemoteFile {
-    pub sha1: String,
-    pub claimed_size: u64,
-}
-
-pub trait DriveClient {
-    fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>>;
-    fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>>;
-    fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()>;
-    fn upload(&mut self, local_path: &Path, remote_parent: &str) -> Result<()>;
-    fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()>;
-    fn trash(&mut self, remote_path: &str) -> Result<()>;
-    fn release_session(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-pub struct CliDrive {
-    binary: PathBuf,
-    session: Option<ReplSession>,
-}
-
-impl CliDrive {
-    pub fn new(binary: PathBuf) -> Self {
-        Self {
-            binary,
-            session: None,
-        }
-    }
-
-    fn session(&mut self) -> Result<&mut ReplSession> {
-        if self.session.is_none() {
-            self.session = Some(ReplSession::start(&self.binary)?);
-        }
-        Ok(self.session.as_mut().expect("session was initialized"))
-    }
-
-    fn read_json(&mut self, args: &[&str]) -> Result<Vec<u8>> {
-        const ATTEMPTS: usize = 3;
-
-        for attempt in 1..=ATTEMPTS {
-            let response = if repl_arguments_supported(args) {
-                self.session()?.command(args)?
-            } else {
-                self.one_shot(args)?
-            };
-            if !response.output.is_empty() {
-                return Ok(response.output);
-            }
-            if attempt < ATTEMPTS && transient_read_failure(&response.error) {
-                eprintln!(
-                    "[pdrive-sync] Proton Drive read failed transiently; retrying ({attempt}/{ATTEMPTS})"
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            bail!("Proton Drive CLI command failed: {}", response.error);
-        }
-        unreachable!()
-    }
-
-    fn write_json(&mut self, args: &[&str]) -> Result<Vec<u8>> {
-        let response = if repl_arguments_supported(args) {
-            self.session()?.command(args)?
-        } else {
-            self.one_shot(args)?
-        };
-        if response.output.is_empty() {
-            bail!("Proton Drive CLI command failed: {}", response.error);
-        }
-        Ok(response.output)
-    }
-
-    fn one_shot(&mut self, args: &[&str]) -> Result<ReplResponse> {
-        drop(self.session.take());
-        let output = Command::new(&self.binary)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run {}", self.binary.display()))?;
-        let stdout = if output.status.success() {
-            output.stdout
-        } else {
-            Vec::new()
-        };
-        Ok(ReplResponse {
-            output: stdout,
-            error: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
-    }
-}
-
-impl DriveClient for CliDrive {
-    fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>> {
-        let output = self.read_json(&["filesystem", "list", "-j", remote_path])?;
-        serde_json::from_slice(&output).context("invalid JSON from Proton Drive list")
-    }
-
-    fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>> {
-        const ATTEMPTS: usize = 3;
-
-        for attempt in 1..=ATTEMPTS {
-            let args = ["filesystem", "info", "-j", remote_path];
-            let response = if repl_arguments_supported(&args) {
-                self.session()?.command(&args)?
-            } else {
-                self.one_shot(&args)?
-            };
-            if !response.output.is_empty() {
-                return serde_json::from_slice(&response.output)
-                    .context("invalid JSON from Proton Drive info")
-                    .map(Some);
-            }
-
-            let message = response.error;
-            if message.starts_with("Node not found:") {
-                return Ok(None);
-            }
-            if attempt < ATTEMPTS && transient_read_failure(&message) {
-                eprintln!(
-                    "[pdrive-sync] Proton Drive read failed transiently; retrying ({attempt}/{ATTEMPTS})"
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            bail!("Proton Drive CLI command failed: {message}");
-        }
-        unreachable!()
-    }
-
-    fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()> {
-        let output = self.write_json(&["filesystem", "create-folder", "-j", parent_path, name])?;
-        serde_json::from_slice::<RemoteNode>(&output)
-            .context("invalid JSON from Proton Drive create-folder")?;
-        Ok(())
-    }
-
-    fn upload(&mut self, local_path: &Path, remote_parent: &str) -> Result<()> {
-        let local_path = local_path
-            .to_str()
-            .context("local upload path is not valid UTF-8")?;
-        let output = self.write_json(&[
-            "filesystem",
-            "upload",
-            "-j",
-            "--file-conflict-strategy",
-            "replace",
-            "--skip-thumbnails",
-            local_path,
-            remote_parent,
-        ])?;
-        let summary: TransferSummary =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive upload")?;
-        if summary.failed_items != 0 || summary.transferred_items > 1 {
-            bail!(
-                "Proton Drive upload reported transferred={} failed={}",
-                summary.transferred_items,
-                summary.failed_items
-            );
-        }
-        Ok(())
-    }
-
-    fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()> {
-        let local_parent = local_parent
-            .to_str()
-            .context("local download path is not valid UTF-8")?;
-        let output = self.write_json(&[
-            "filesystem",
-            "download",
-            "-j",
-            "--file-conflict-strategy",
-            "replace",
-            remote_path,
-            local_parent,
-        ])?;
-        let summary: TransferSummary =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive download")?;
-        if summary.failed_items != 0 || summary.transferred_items != 1 {
-            bail!(
-                "Proton Drive download reported transferred={} failed={}",
-                summary.transferred_items,
-                summary.failed_items
-            );
-        }
-        Ok(())
-    }
-
-    fn trash(&mut self, remote_path: &str) -> Result<()> {
-        let output = self.write_json(&["filesystem", "trash", "-j", remote_path])?;
-        let results: Vec<OperationResult> =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive trash")?;
-        if results.len() != 1 || !results[0].ok {
-            bail!("Proton Drive trash operation did not succeed");
-        }
-        Ok(())
-    }
-
-    fn release_session(&mut self) -> Result<()> {
-        drop(self.session.take());
-        release_cli_cache_pages();
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TransferSummary {
-    transferred_items: usize,
-    failed_items: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct OperationResult {
-    ok: bool,
-}
-
-struct ReplResponse {
-    output: Vec<u8>,
-    error: String,
-}
-
-struct ReplSession {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    errors: Receiver<String>,
-}
-
-impl ReplSession {
-    const PROMPT: &'static [u8] = b"proton-drive> ";
-
-    fn start(binary: &Path) -> Result<Self> {
-        let mut child = Command::new(binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to start {} REPL", binary.display()))?;
-        let input = child
-            .stdin
-            .take()
-            .context("Proton Drive REPL has no stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("Proton Drive REPL has no stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Proton Drive REPL has no stderr")?;
-        let (error_sender, errors) = mpsc::channel();
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(std::result::Result::ok) {
-                let _ = error_sender.send(line);
-            }
-        });
-
-        let mut session = Self {
-            child,
-            input,
-            output: BufReader::new(stdout),
-            errors,
-        };
-        let startup = session.read_to_prompt()?;
-        if !startup.is_empty() {
-            bail!(
-                "unexpected output while starting Proton Drive REPL: {}",
-                String::from_utf8_lossy(&startup).trim()
-            );
-        }
-        Ok(session)
-    }
-
-    fn command(&mut self, args: &[&str]) -> Result<ReplResponse> {
-        while self.errors.try_recv().is_ok() {}
-        reject_repl_newlines(args)?;
-        let command = args
-            .iter()
-            .map(|argument| quote_repl_argument(argument))
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.input.write_all(command.as_bytes())?;
-        self.input.write_all(b"\n")?;
-        self.input.flush()?;
-
-        let output = self.read_to_prompt()?;
-        let mut error_lines = Vec::new();
-        if output.is_empty()
-            && let Ok(line) = self.errors.recv_timeout(Duration::from_millis(100))
-        {
-            error_lines.push(line);
-        }
-        error_lines.extend(self.errors.try_iter());
-        Ok(ReplResponse {
-            output,
-            error: error_lines.join("\n"),
-        })
-    }
-
-    fn read_to_prompt(&mut self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        loop {
-            let available = self.output.fill_buf()?;
-            if available.is_empty() {
-                let status = self.child.try_wait()?;
-                let error = self.errors.try_iter().collect::<Vec<_>>().join("\n");
-                bail!(
-                    "Proton Drive REPL closed unexpectedly{}{}",
-                    status.map_or_else(String::new, |value| format!(" with {value}")),
-                    if error.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {error}")
-                    }
-                );
-            }
-            let byte = available[0];
-            self.output.consume(1);
-            bytes.push(byte);
-
-            if bytes == Self::PROMPT {
-                bytes.clear();
-                return Ok(bytes);
-            }
-            if bytes.ends_with(Self::PROMPT)
-                && bytes.get(bytes.len().saturating_sub(Self::PROMPT.len() + 1)) == Some(&b'\n')
-            {
-                bytes.truncate(bytes.len() - Self::PROMPT.len() - 1);
-                return Ok(bytes);
-            }
-        }
-    }
-}
-
-impl Drop for ReplSession {
-    fn drop(&mut self) {
-        let _ = self.input.write_all(b"exit\n");
-        let _ = self.input.flush();
-        for _ in 0..20 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn reject_repl_newlines(args: &[&str]) -> Result<()> {
-    if !repl_arguments_supported(args) {
-        bail!("Proton Drive REPL arguments cannot contain newlines");
-    }
-    Ok(())
-}
-
-fn repl_arguments_supported(args: &[&str]) -> bool {
-    !args.iter().any(|argument| argument.contains(['\n', '\r']))
-}
-
-fn quote_repl_argument(argument: &str) -> String {
-    format!(
-        "\"{}\"",
-        argument.replace('\\', "\\\\").replace('"', "\\\"")
-    )
-}
-
-fn transient_read_failure(message: &str) -> bool {
-    message.contains("You need to login first")
-        || message.contains("SQLITE_BUSY")
-        || message.contains("database is locked")
-}
-
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SyncSummary {
     pub scanned: usize,
@@ -518,90 +123,15 @@ struct LocalFile {
 }
 
 #[derive(Clone, Debug)]
-struct FileState {
-    size: u64,
-    mtime_ns: i64,
-    sha1: String,
+struct PendingUpload {
+    file: LocalFile,
+    checkpoint_sha1: Option<String>,
 }
 
 #[derive(Default)]
 struct RemoteTree {
     files: HashMap<String, RemoteFile>,
     directories: HashSet<String>,
-}
-
-pub fn default_state_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("pdrive-sync"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("pdrive-sync"))
-}
-
-pub fn optimize_cli_cache(config: &Config) -> Result<usize> {
-    if !config.optimize_cli_cache {
-        return Ok(0);
-    }
-    let cache_dir = proton_cli_cache_dir()?;
-    optimize_cli_cache_dir(&cache_dir)
-}
-
-fn proton_cli_cache_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("PROTON_DRIVE_CACHE_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(path).join("proton-drive-cli"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cache").join("proton-drive-cli"))
-}
-
-fn release_cli_cache_pages() {
-    #[cfg(target_os = "linux")]
-    if let Ok(cache_dir) = proton_cli_cache_dir() {
-        for name in [
-            "cache-entities.sqlite",
-            "cache-entities.sqlite-wal",
-            "cache-crypto.sqlite",
-            "cache-crypto.sqlite-wal",
-        ] {
-            let Ok(file) = File::open(cache_dir.join(name)) else {
-                continue;
-            };
-            use std::os::fd::AsRawFd;
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
-        }
-    }
-}
-
-pub fn optimize_cli_cache_dir(cache_dir: &Path) -> Result<usize> {
-    let mut optimized = 0;
-    for name in ["cache-entities.sqlite", "cache-crypto.sqlite"] {
-        let path = cache_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        let connection = Connection::open(&path)
-            .with_context(|| format!("failed to open Proton Drive cache {}", path.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        let mode: String = connection
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .with_context(|| format!("failed to enable WAL for {}", path.display()))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            bail!(
-                "Proton Drive cache {} rejected WAL mode: {mode}",
-                path.display()
-            );
-        }
-        optimized += 1;
-    }
-    Ok(optimized)
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
@@ -635,39 +165,6 @@ pub fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn open_database(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let connection =
-        Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    connection.execute_batch(
-        "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = FULL;
-        CREATE TABLE IF NOT EXISTS files (
-            mirror TEXT NOT NULL,
-            path TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime_ns INTEGER NOT NULL,
-            sha1 TEXT NOT NULL,
-            PRIMARY KEY (mirror, path)
-        );
-        CREATE TABLE IF NOT EXISTS remote_directories (
-            mirror TEXT NOT NULL,
-            path TEXT NOT NULL,
-            PRIMARY KEY (mirror, path)
-        );
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        ",
-    )?;
-    Ok(connection)
-}
-
 pub fn sync_all(
     config: &Config,
     connection: &Connection,
@@ -696,24 +193,18 @@ pub fn sync_push(
 
     let excludes = build_excludes(mirror)?;
     let (files, skipped_symlinks) = scan_local_files(mirror, &excludes)?;
+    let states = all_file_states(connection, &mirror.name)?;
     let baseline_key = format!("baseline:{}", mirror.name);
     let baseline_complete = metadata_value(connection, &baseline_key)?.as_deref() == Some("1");
-    let mut remote_tree = if baseline_complete {
-        None
+    let mut remote_tree = if !baseline_complete && mirror.delete == DeletePolicy::Trash {
+        Some(inventory_remote(
+            mirror,
+            connection,
+            drive,
+            Some("baseline"),
+        )?)
     } else {
-        let mut tree = RemoteTree::default();
-        tree.directories.insert(String::new());
-        let mut visited = HashSet::new();
-        load_remote_tree(drive, &mirror.remote, "", &mut visited, &mut tree)?;
-        eprintln!(
-            "[pdrive-sync] {}: remote baseline listed {} files in {} directories",
-            mirror.name,
-            tree.files.len(),
-            tree.directories.len()
-        );
-        replace_remote_directories(connection, &mirror.name, &tree.directories)?;
-        drive.release_session()?;
-        Some(tree)
+        None
     };
 
     let mut summary = SyncSummary {
@@ -722,118 +213,78 @@ pub fn sync_push(
         ..SyncSummary::default()
     };
     let mut seen = HashSet::with_capacity(files.len());
-    let mut checkpoints = CheckpointBatch::new(connection);
+    let mut uploads = Vec::new();
 
     for local in files {
         seen.insert(local.relative.clone());
-        if let Some(previous) = file_state(connection, &mirror.name, &local.relative)? {
-            if previous.size == local.size && previous.mtime_ns == local.mtime_ns {
-                summary.unchanged += 1;
-                continue;
-            }
-
-            let digest = sha1_file(&local.absolute)?;
-            if previous.sha1 == digest {
-                checkpoints.push(
-                    &mirror.name,
-                    &local.relative,
-                    local.size,
-                    local.mtime_ns,
-                    &digest,
-                )?;
-                summary.unchanged += 1;
-                continue;
-            }
-
-            if remote_matches(
-                mirror,
-                drive,
-                remote_tree.as_ref(),
-                &local.relative,
-                local.size,
-                &digest,
-            )? {
-                checkpoints.push(
-                    &mirror.name,
-                    &local.relative,
-                    local.size,
-                    local.mtime_ns,
-                    &digest,
-                )?;
-                summary.matched_remote += 1;
-                continue;
-            }
-
-            upload_changed_file(mirror, connection, drive, &local)?;
-            checkpoints.push(
-                &mirror.name,
-                &local.relative,
-                local.size,
-                local.mtime_ns,
-                &digest,
-            )?;
-            summary.uploaded += 1;
+        if states.get(&local.relative).is_some_and(|previous| {
+            previous.size == local.size && previous.mtime_ns == local.mtime_ns
+        }) {
+            summary.unchanged += 1;
             continue;
         }
-
-        let digest = sha1_file(&local.absolute)?;
-        let remote_match = remote_matches(
-            mirror,
-            drive,
-            remote_tree.as_ref(),
-            &local.relative,
-            local.size,
-            &digest,
-        )?;
-
-        if remote_match {
-            checkpoints.push(
-                &mirror.name,
-                &local.relative,
-                local.size,
-                local.mtime_ns,
-                &digest,
-            )?;
-            summary.matched_remote += 1;
-        } else {
-            upload_changed_file(mirror, connection, drive, &local)?;
-            checkpoints.push(
-                &mirror.name,
-                &local.relative,
-                local.size,
-                local.mtime_ns,
-                &digest,
-            )?;
-            summary.uploaded += 1;
-        }
+        uploads.push(PendingUpload {
+            file: local,
+            checkpoint_sha1: None,
+        });
     }
-    checkpoints.flush()?;
+    if !uploads.is_empty() {
+        eprintln!(
+            "[pdrive-sync] {}: {} files need remote reconciliation",
+            mirror.name,
+            uploads.len()
+        );
+    }
+    execute_uploads(mirror, connection, drive, uploads, &mut summary)?;
 
     let stale = stale_paths(connection, &mirror.name, &seen)?;
-    for path in stale {
-        if excludes.is_match(&path) {
-            continue;
+    if mirror.delete == DeletePolicy::Trash {
+        if remote_tree.is_none() && !stale.is_empty() {
+            remote_tree = Some(inventory_remote(
+                mirror,
+                connection,
+                drive,
+                Some("cleanup"),
+            )?);
         }
-        if mirror.delete == DeletePolicy::Trash {
-            let remote = remote_path(&mirror.remote, &path);
-            if drive.info(&remote)?.is_some() {
-                drive.trash(&remote)?;
-                summary.trashed += 1;
+
+        let mut trash_paths = BTreeSet::new();
+        if let Some(tree) = remote_tree.as_ref() {
+            for path in &stale {
+                if excludes.is_match(path) {
+                    continue;
+                }
+                if tree.files.contains_key(path) {
+                    trash_paths.insert(path.clone());
+                } else {
+                    delete_file_state(connection, &mirror.name, path)?;
+                }
+            }
+            if !baseline_complete {
+                trash_paths.extend(
+                    tree.files
+                        .keys()
+                        .filter(|path| !seen.contains(*path) && !excludes.is_match(path))
+                        .cloned(),
+                );
             }
         }
-        delete_file_state(connection, &mirror.name, &path)?;
-    }
-
-    if mirror.delete == DeletePolicy::Trash
-        && let Some(tree) = remote_tree.as_ref()
-    {
-        for path in tree
-            .files
-            .keys()
-            .filter(|path| !seen.contains(*path) && !excludes.is_match(*path))
-        {
-            drive.trash(&remote_path(&mirror.remote, path))?;
-            summary.trashed += 1;
+        let trash_items = trash_paths
+            .into_iter()
+            .filter_map(|path| {
+                remote_tree
+                    .as_ref()
+                    .and_then(|tree| tree.files.get(&path))
+                    .cloned()
+                    .map(|remote| (path, remote))
+            })
+            .collect();
+        execute_remote_trash(mirror, connection, drive, trash_items, &mut summary)?;
+    } else {
+        for path in stale {
+            if !excludes.is_match(&path) {
+                delete_file_state(connection, &mirror.name, &path)?;
+            }
         }
     }
     set_metadata(connection, &baseline_key, "1")?;
@@ -853,12 +304,7 @@ pub fn sync_pull(
         .into_iter()
         .map(|file| (file.relative.clone(), file))
         .collect::<HashMap<_, _>>();
-    let mut tree = RemoteTree::default();
-    tree.directories.insert(String::new());
-    let mut visited = HashSet::new();
-    load_remote_tree(drive, &sync.remote, "", &mut visited, &mut tree)?;
-    replace_remote_directories(connection, &sync.name, &tree.directories)?;
-    drive.release_session()?;
+    let tree = inventory_remote(sync, connection, drive, None)?;
 
     let mut summary = SyncSummary {
         scanned: local_files.len(),
@@ -945,10 +391,9 @@ pub fn sync_two_way(
     let (local_files, skipped_symlinks) = scan_local_files(sync, &excludes)?;
     let mut local = HashMap::with_capacity(local_files.len());
     for file in local_files {
-        let sha1 = if states
-            .get(&file.relative)
-            .is_some_and(|state| state.size == file.size && state.mtime_ns == file.mtime_ns)
-        {
+        let sha1 = if states.get(&file.relative).is_some_and(|state| {
+            !state.sha1.is_empty() && state.size == file.size && state.mtime_ns == file.mtime_ns
+        }) {
             states[&file.relative].sha1.clone()
         } else {
             sha1_file(&file.absolute)?
@@ -956,12 +401,7 @@ pub fn sync_two_way(
         local.insert(file.relative.clone(), LocalSnapshot { file, sha1 });
     }
 
-    let mut remote = RemoteTree::default();
-    remote.directories.insert(String::new());
-    let mut visited = HashSet::new();
-    load_remote_tree(drive, &sync.remote, "", &mut visited, &mut remote)?;
-    replace_remote_directories(connection, &sync.name, &remote.directories)?;
-    drive.release_session()?;
+    let mut remote = inventory_remote(sync, connection, drive, None)?;
     remote.files.retain(|path, _| !excludes.is_match(path));
     let actions = plan_two_way(sync, &local, &remote.files, &states)?;
 
@@ -982,56 +422,53 @@ pub fn sync_two_way(
         checkpoints.push(&sync.name, path, file.size, file.mtime_ns, sha1)?;
         summary.unchanged += 1;
     }
-
-    for action in actions.iter().filter(|action| {
-        matches!(
-            action,
-            TwoWayAction::Upload { .. } | TwoWayAction::Download { .. }
-        )
-    }) {
-        match action {
-            TwoWayAction::Upload { path, sha1 } => {
-                let file = &local[path].file;
-                upload_changed_file(sync, connection, drive, file)?;
-                checkpoints.push(&sync.name, path, file.size, file.mtime_ns, sha1)?;
-                summary.uploaded += 1;
-            }
-            TwoWayAction::Download { path } => {
-                let remote_file = &remote.files[path];
-                let file = download_remote_file(sync, drive, path, remote_file)?;
-                checkpoints.push(
-                    &sync.name,
-                    path,
-                    file.size,
-                    file.mtime_ns,
-                    &remote_file.sha1,
-                )?;
-                summary.downloaded += 1;
-            }
-            _ => unreachable!(),
-        }
-    }
     checkpoints.flush()?;
 
-    for action in actions.iter().filter(|action| {
-        matches!(
-            action,
-            TwoWayAction::TrashRemote { .. } | TwoWayAction::TrashLocal { .. }
-        )
-    }) {
-        match action {
-            TwoWayAction::TrashRemote { path } => {
-                drive.trash(&remote_path(&sync.remote, path))?;
-                delete_file_state(connection, &sync.name, path)?;
-                summary.trashed += 1;
-            }
-            TwoWayAction::TrashLocal { path } => {
-                trash::delete(&local[path].file.absolute)
-                    .with_context(|| format!("failed to trash local path {path}"))?;
-                delete_file_state(connection, &sync.name, path)?;
-                summary.trashed_local += 1;
-            }
-            _ => unreachable!(),
+    let uploads = actions
+        .iter()
+        .filter_map(|action| match action {
+            TwoWayAction::Upload { path, sha1 } => Some(PendingUpload {
+                file: local[path].file.clone(),
+                checkpoint_sha1: Some(sha1.clone()),
+            }),
+            _ => None,
+        })
+        .collect();
+    execute_uploads(sync, connection, drive, uploads, &mut summary)?;
+
+    let mut download_checkpoints = CheckpointBatch::new(connection);
+    for action in &actions {
+        let TwoWayAction::Download { path } = action else {
+            continue;
+        };
+        let remote_file = &remote.files[path];
+        let file = download_remote_file(sync, drive, path, remote_file)?;
+        download_checkpoints.push(
+            &sync.name,
+            path,
+            file.size,
+            file.mtime_ns,
+            &remote_file.sha1,
+        )?;
+        summary.downloaded += 1;
+    }
+    download_checkpoints.flush()?;
+
+    let remote_trash = actions
+        .iter()
+        .filter_map(|action| match action {
+            TwoWayAction::TrashRemote { path } => Some((path.clone(), remote.files[path].clone())),
+            _ => None,
+        })
+        .collect();
+    execute_remote_trash(sync, connection, drive, remote_trash, &mut summary)?;
+
+    for action in &actions {
+        if let TwoWayAction::TrashLocal { path } = action {
+            trash::delete(&local[path].file.absolute)
+                .with_context(|| format!("failed to trash local path {path}"))?;
+            delete_file_state(connection, &sync.name, path)?;
+            summary.trashed_local += 1;
         }
     }
     Ok(summary)
@@ -1195,34 +632,150 @@ fn download_remote_file(
     local_file(&sync.local, target)
 }
 
-fn remote_matches(
-    mirror: &SyncConfig,
-    drive: &mut dyn DriveClient,
-    remote_tree: Option<&RemoteTree>,
-    relative: &str,
-    size: u64,
-    digest: &str,
-) -> Result<bool> {
-    let remote = if let Some(tree) = remote_tree {
-        tree.files.get(relative).cloned()
-    } else {
-        remote_file(drive.info(&remote_path(&mirror.remote, relative))?)
-    };
-    Ok(remote
-        .is_some_and(|file| file.sha1.eq_ignore_ascii_case(digest) && file.claimed_size == size))
-}
-
-fn upload_changed_file(
-    mirror: &SyncConfig,
+fn execute_uploads(
+    sync: &SyncConfig,
     connection: &Connection,
     drive: &mut dyn DriveClient,
-    local: &LocalFile,
+    uploads: Vec<PendingUpload>,
+    summary: &mut SyncSummary,
 ) -> Result<()> {
-    let parent = relative_parent(&local.relative);
-    ensure_remote_directory(mirror, connection, drive, parent)?;
-    drive
-        .upload(&local.absolute, &remote_path(&mirror.remote, parent))
-        .with_context(|| format!("failed to upload {}", local.relative))
+    if uploads.is_empty() {
+        return Ok(());
+    }
+
+    let total = uploads.len();
+    let mut by_parent = BTreeMap::<String, Vec<PendingUpload>>::new();
+    for upload in uploads {
+        by_parent
+            .entry(relative_parent(&upload.file.relative).to_owned())
+            .or_default()
+            .push(upload);
+    }
+
+    let mut completed = 0;
+    let mut failures = Vec::new();
+    for (parent, parent_uploads) in by_parent {
+        ensure_remote_directory(sync, connection, drive, &parent)?;
+        for batch in parent_uploads.chunks(UPLOAD_BATCH_SIZE) {
+            let batch_bytes = batch.iter().map(|upload| upload.file.size).sum::<u64>();
+            eprintln!(
+                "[pdrive-sync] {}: uploading batch of {} files ({} bytes)",
+                sync.name,
+                batch.len(),
+                batch_bytes
+            );
+            let local_paths = batch
+                .iter()
+                .map(|upload| upload.file.absolute.clone())
+                .collect::<Vec<_>>();
+            let result = drive
+                .upload_many(&local_paths, &remote_path(&sync.remote, &parent))
+                .with_context(|| {
+                    format!("failed to upload batch for remote directory {parent:?}")
+                })?;
+            let failed_names = result
+                .failures
+                .iter()
+                .map(|failure| failure.name.as_str())
+                .collect::<HashSet<_>>();
+            let mut checkpoints = CheckpointBatch::new(connection);
+            for upload in batch {
+                let name = upload
+                    .file
+                    .absolute
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("local upload path has no UTF-8 file name")?;
+                if failed_names.contains(name) {
+                    continue;
+                }
+                checkpoints.push(
+                    &sync.name,
+                    &upload.file.relative,
+                    upload.file.size,
+                    upload.file.mtime_ns,
+                    upload.checkpoint_sha1.as_deref().unwrap_or_default(),
+                )?;
+            }
+            checkpoints.flush()?;
+
+            summary.uploaded += result.transferred_items;
+            summary.matched_remote += result.skipped_items;
+            completed += batch.len();
+            eprintln!(
+                "[pdrive-sync] {}: reconciled {completed}/{total} files (uploaded={} already_present={} failed={} bytes={})",
+                sync.name,
+                result.transferred_items,
+                result.skipped_items,
+                result.failures.len(),
+                result.transferred_bytes
+            );
+            failures.extend(result.failures);
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let first = &failures[0];
+        bail!(
+            "{} uploads failed; first failure was {}: {}",
+            failures.len(),
+            first.name,
+            first.error
+        )
+    }
+}
+
+fn execute_remote_trash(
+    sync: &SyncConfig,
+    connection: &Connection,
+    drive: &mut dyn DriveClient,
+    items: Vec<(String, RemoteFile)>,
+    summary: &mut SyncSummary,
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let total = items.len();
+    let mut completed = 0;
+    let mut failures = 0;
+    for batch in items.chunks(TRASH_BATCH_SIZE) {
+        eprintln!(
+            "[pdrive-sync] {}: moving {} remote files to trash",
+            sync.name,
+            batch.len()
+        );
+        let targets = batch
+            .iter()
+            .map(|(path, remote)| TrashTarget {
+                remote_path: remote_path(&sync.remote, path),
+                uid: remote.uid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let result = drive.trash_many(&targets)?;
+        let succeeded = result.succeeded_uids.into_iter().collect::<HashSet<_>>();
+        for (path, remote) in batch {
+            if succeeded.contains(&remote.uid) {
+                delete_file_state(connection, &sync.name, path)?;
+                summary.trashed += 1;
+            }
+        }
+        failures += result.failed_uids.len();
+        completed += batch.len();
+        eprintln!(
+            "[pdrive-sync] {}: remote cleanup {completed}/{total} (failed={})",
+            sync.name,
+            result.failed_uids.len()
+        );
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        bail!("{failures} remote files could not be moved to trash")
+    }
 }
 
 fn require_ready(mirror: &SyncConfig) -> Result<()> {
@@ -1372,6 +925,29 @@ fn sha1_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn inventory_remote(
+    sync: &SyncConfig,
+    connection: &Connection,
+    drive: &mut dyn DriveClient,
+    reason: Option<&str>,
+) -> Result<RemoteTree> {
+    let mut tree = RemoteTree::default();
+    tree.directories.insert(String::new());
+    let mut visited = HashSet::new();
+    load_remote_tree(drive, &sync.remote, "", &mut visited, &mut tree)?;
+    if let Some(reason) = reason {
+        eprintln!(
+            "[pdrive-sync] {}: remote {reason} listed {} files in {} directories",
+            sync.name,
+            tree.files.len(),
+            tree.directories.len()
+        );
+    }
+    replace_remote_directories(connection, &sync.name, &tree.directories)?;
+    drive.release_session()?;
+    Ok(tree)
+}
+
 fn load_remote_tree(
     drive: &mut dyn DriveClient,
     remote_root: &str,
@@ -1420,8 +996,10 @@ fn remote_file(node: Option<RemoteNode>) -> Option<RemoteFile> {
     if node.kind != "file" {
         return None;
     }
+    let uid = node.uid;
     let revision = node.active_revision?;
     Some(RemoteFile {
+        uid,
         sha1: revision.claimed_digests.sha1,
         claimed_size: revision.claimed_size,
     })
@@ -1479,234 +1057,6 @@ fn relative_parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-fn file_state(connection: &Connection, mirror: &str, path: &str) -> Result<Option<FileState>> {
-    connection
-        .query_row(
-            "SELECT size, mtime_ns, sha1 FROM files WHERE mirror = ?1 AND path = ?2",
-            params![mirror, path],
-            |row| {
-                Ok(FileState {
-                    size: row.get(0)?,
-                    mtime_ns: row.get(1)?,
-                    sha1: row.get(2)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
-fn all_file_states(connection: &Connection, mirror: &str) -> Result<HashMap<String, FileState>> {
-    let mut statement = connection
-        .prepare("SELECT path, size, mtime_ns, sha1 FROM files WHERE mirror = ?1 ORDER BY path")?;
-    let rows = statement.query_map([mirror], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            FileState {
-                size: row.get(1)?,
-                mtime_ns: row.get(2)?,
-                sha1: row.get(3)?,
-            },
-        ))
-    })?;
-    let mut states = HashMap::new();
-    for row in rows {
-        let (path, state) = row?;
-        states.insert(path, state);
-    }
-    Ok(states)
-}
-
-fn save_file_state(
-    connection: &Connection,
-    mirror: &str,
-    path: &str,
-    size: u64,
-    mtime_ns: i64,
-    sha1: &str,
-) -> Result<()> {
-    connection.execute(
-        "
-        INSERT INTO files (mirror, path, size, mtime_ns, sha1)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT (mirror, path) DO UPDATE SET
-            size = excluded.size,
-            mtime_ns = excluded.mtime_ns,
-            sha1 = excluded.sha1
-        ",
-        params![mirror, path, size, mtime_ns, sha1],
-    )?;
-    Ok(())
-}
-
-#[derive(Debug)]
-struct FileCheckpoint {
-    mirror: String,
-    path: String,
-    size: u64,
-    mtime_ns: i64,
-    sha1: String,
-}
-
-struct CheckpointBatch<'connection> {
-    connection: &'connection Connection,
-    pending: Vec<FileCheckpoint>,
-    #[cfg(test)]
-    commits: usize,
-}
-
-impl<'connection> CheckpointBatch<'connection> {
-    fn new(connection: &'connection Connection) -> Self {
-        Self {
-            connection,
-            pending: Vec::with_capacity(CHECKPOINT_BATCH_SIZE),
-            #[cfg(test)]
-            commits: 0,
-        }
-    }
-
-    fn push(
-        &mut self,
-        mirror: &str,
-        path: &str,
-        size: u64,
-        mtime_ns: i64,
-        sha1: &str,
-    ) -> Result<()> {
-        self.pending.push(FileCheckpoint {
-            mirror: mirror.to_owned(),
-            path: path.to_owned(),
-            size,
-            mtime_ns,
-            sha1: sha1.to_owned(),
-        });
-        if self.pending.len() >= CHECKPOINT_BATCH_SIZE {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let transaction = self.connection.unchecked_transaction()?;
-        for checkpoint in &self.pending {
-            save_file_state(
-                &transaction,
-                &checkpoint.mirror,
-                &checkpoint.path,
-                checkpoint.size,
-                checkpoint.mtime_ns,
-                &checkpoint.sha1,
-            )?;
-        }
-        transaction.commit()?;
-        self.pending.clear();
-        #[cfg(test)]
-        {
-            self.commits += 1;
-        }
-        Ok(())
-    }
-}
-
-fn delete_file_state(connection: &Connection, mirror: &str, path: &str) -> Result<()> {
-    connection.execute(
-        "DELETE FROM files WHERE mirror = ?1 AND path = ?2",
-        params![mirror, path],
-    )?;
-    Ok(())
-}
-
-fn stale_paths(
-    connection: &Connection,
-    mirror: &str,
-    seen: &HashSet<String>,
-) -> Result<Vec<String>> {
-    let mut statement =
-        connection.prepare("SELECT path FROM files WHERE mirror = ?1 ORDER BY path")?;
-    let rows = statement.query_map([mirror], |row| row.get::<_, String>(0))?;
-    let mut stale = Vec::new();
-    for row in rows {
-        let path = row?;
-        if !seen.contains(&path) {
-            stale.push(path);
-        }
-    }
-    Ok(stale)
-}
-
-fn metadata_value(connection: &Connection, key: &str) -> Result<Option<String>> {
-    connection
-        .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(Into::into)
-}
-
-fn set_metadata(connection: &Connection, key: &str, value: &str) -> Result<()> {
-    connection.execute(
-        "
-        INSERT INTO metadata (key, value) VALUES (?1, ?2)
-        ON CONFLICT (key) DO UPDATE SET value = excluded.value
-        ",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-fn replace_remote_directories(
-    connection: &Connection,
-    mirror: &str,
-    directories: &HashSet<String>,
-) -> Result<()> {
-    let transaction = connection.unchecked_transaction()?;
-    transaction.execute("DELETE FROM remote_directories WHERE mirror = ?1", [mirror])?;
-    for path in directories {
-        transaction.execute(
-            "INSERT INTO remote_directories (mirror, path) VALUES (?1, ?2)",
-            params![mirror, path],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn remote_directory_known(connection: &Connection, mirror: &str, path: &str) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT 1 FROM remote_directories WHERE mirror = ?1 AND path = ?2",
-            params![mirror, path],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|value| value.is_some())
-        .map_err(Into::into)
-}
-
-fn save_remote_directory(connection: &Connection, mirror: &str, path: &str) -> Result<()> {
-    connection.execute(
-        "INSERT OR IGNORE INTO remote_directories (mirror, path) VALUES (?1, ?2)",
-        params![mirror, path],
-    )?;
-    Ok(())
-}
-
-pub fn write_success_file(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let timestamp = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        .into_bytes();
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&temporary, timestamp)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
-}
-
 pub fn resolved_state_paths(config: &Config) -> Result<(PathBuf, PathBuf)> {
     let state_dir = default_state_dir()?;
     let database = config
@@ -1752,10 +1102,14 @@ mod tests {
         contents: BTreeMap<String, Vec<u8>>,
         directories: HashSet<String>,
         uploads: Vec<String>,
+        upload_batches: Vec<Vec<String>>,
         downloads: Vec<String>,
         trashed: Vec<String>,
+        trash_batches: Vec<Vec<String>>,
         fail_upload: bool,
+        fail_upload_names: HashSet<String>,
         fail_after_upload: bool,
+        info_calls: usize,
         released_sessions: usize,
     }
 
@@ -1769,7 +1123,7 @@ mod tests {
 
         fn file_node(path: &str, file: &RemoteFile) -> RemoteNode {
             RemoteNode {
-                uid: format!("uid:{path}"),
+                uid: file.uid.clone(),
                 name: ResultValue {
                     ok: true,
                     value: Some(path.rsplit('/').next().unwrap().to_string()),
@@ -1808,6 +1162,7 @@ mod tests {
             self.files.insert(
                 path.clone(),
                 RemoteFile {
+                    uid: format!("uid:{path}"),
                     sha1: format!("{:x}", hasher.finalize()),
                     claimed_size: content.len() as u64,
                 },
@@ -1837,6 +1192,7 @@ mod tests {
         }
 
         fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>> {
+            self.info_calls += 1;
             if let Some(file) = self.files.get(remote_path) {
                 return Ok(Some(Self::file_node(remote_path, file)));
             }
@@ -1852,26 +1208,67 @@ mod tests {
             Ok(())
         }
 
-        fn upload(&mut self, local_path: &Path, remote_parent: &str) -> Result<()> {
+        fn upload_many(
+            &mut self,
+            local_paths: &[PathBuf],
+            remote_parent: &str,
+        ) -> Result<UploadBatchResult> {
             if self.fail_upload {
-                bail!("simulated upload failure");
+                return Ok(UploadBatchResult {
+                    failures: local_paths
+                        .iter()
+                        .map(|path| UploadFailure {
+                            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                            error: "simulated upload failure".to_owned(),
+                        })
+                        .collect(),
+                    ..UploadBatchResult::default()
+                });
             }
-            let name = local_path.file_name().unwrap().to_string_lossy();
-            let path = format!("{}/{}", remote_parent.trim_end_matches('/'), name);
-            let metadata = fs::metadata(local_path)?;
-            self.files.insert(
-                path.clone(),
-                RemoteFile {
-                    sha1: sha1_file(local_path)?,
-                    claimed_size: metadata.len(),
-                },
+            self.upload_batches.push(
+                local_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
             );
-            self.contents.insert(path.clone(), fs::read(local_path)?);
-            self.uploads.push(path);
+            let mut result = UploadBatchResult::default();
+            for local_path in local_paths {
+                let name = local_path.file_name().unwrap().to_string_lossy();
+                if self.fail_upload_names.contains(name.as_ref()) {
+                    result.failures.push(UploadFailure {
+                        name: name.into_owned(),
+                        error: "simulated upload failure".to_owned(),
+                    });
+                    continue;
+                }
+                let path = format!("{}/{}", remote_parent.trim_end_matches('/'), name);
+                let metadata = fs::metadata(local_path)?;
+                let digest = sha1_file(local_path)?;
+                if self
+                    .files
+                    .get(&path)
+                    .is_some_and(|file| file.sha1 == digest && file.claimed_size == metadata.len())
+                {
+                    result.skipped_items += 1;
+                    continue;
+                }
+                self.files.insert(
+                    path.clone(),
+                    RemoteFile {
+                        uid: format!("uid:{path}"),
+                        sha1: digest,
+                        claimed_size: metadata.len(),
+                    },
+                );
+                self.contents.insert(path.clone(), fs::read(local_path)?);
+                self.uploads.push(path);
+                result.transferred_items += 1;
+                result.transferred_bytes += metadata.len();
+            }
             if self.fail_after_upload {
                 bail!("simulated failure after accepted upload");
             }
-            Ok(())
+            Ok(result)
         }
 
         fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()> {
@@ -1888,11 +1285,24 @@ mod tests {
             Ok(())
         }
 
-        fn trash(&mut self, remote_path: &str) -> Result<()> {
-            self.files.remove(remote_path);
-            self.contents.remove(remote_path);
-            self.trashed.push(remote_path.to_string());
-            Ok(())
+        fn trash_many(&mut self, targets: &[TrashTarget]) -> Result<TrashBatchResult> {
+            self.trash_batches.push(
+                targets
+                    .iter()
+                    .map(|target| target.remote_path.clone())
+                    .collect(),
+            );
+            let mut result = TrashBatchResult::default();
+            for target in targets {
+                if self.files.remove(&target.remote_path).is_some() {
+                    self.contents.remove(&target.remote_path);
+                    self.trashed.push(target.remote_path.clone());
+                    result.succeeded_uids.push(target.uid.clone());
+                } else {
+                    result.failed_uids.push(target.uid.clone());
+                }
+            }
+            Ok(result)
         }
 
         fn release_session(&mut self) -> Result<()> {
@@ -1951,6 +1361,7 @@ mod tests {
         drive.files.insert(
             format!("{}/already-there.txt", fixture.mirror.remote),
             RemoteFile {
+                uid: format!("uid:{}/already-there.txt", fixture.mirror.remote),
                 sha1: sha1_file(&path).unwrap(),
                 claimed_size: fs::metadata(path).unwrap().len(),
             },
@@ -1961,7 +1372,6 @@ mod tests {
         assert_eq!(summary.matched_remote, 1);
         assert_eq!(summary.uploaded, 0);
         assert!(drive.uploads.is_empty());
-        assert_eq!(drive.released_sessions, 1);
     }
 
     #[test]
@@ -1990,7 +1400,7 @@ mod tests {
         fs::write(&path, original).unwrap();
         let summary = sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
 
-        assert_eq!(summary.unchanged, 1);
+        assert_eq!(summary.matched_remote, 1);
         assert_eq!(drive.uploads.len(), before);
     }
 
@@ -2006,6 +1416,106 @@ mod tests {
 
         assert_eq!(summary.uploaded, 1);
         assert_eq!(drive.uploads.len(), 2);
+    }
+
+    #[test]
+    fn push_reconciles_files_in_bounded_batches_without_remote_info_calls() {
+        let fixture = Fixture::new();
+        for index in 0..(UPLOAD_BATCH_SIZE + 1) {
+            fixture.write(&format!("file-{index:02}.txt"), "content");
+        }
+        let mut drive = MockDrive::with_root(&fixture.mirror.remote);
+
+        let summary = sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+
+        assert_eq!(summary.uploaded, UPLOAD_BATCH_SIZE + 1);
+        assert_eq!(drive.info_calls, 0);
+        assert_eq!(
+            drive
+                .upload_batches
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![UPLOAD_BATCH_SIZE, 1]
+        );
+        assert!(
+            all_file_states(&fixture.connection, &fixture.mirror.name)
+                .unwrap()
+                .values()
+                .all(|state| state.sha1.is_empty())
+        );
+    }
+
+    #[test]
+    fn successful_files_are_checkpointed_when_a_batch_partially_fails() {
+        let fixture = Fixture::new();
+        fixture.write("good.txt", "uploaded");
+        fixture.write("retry.txt", "retry later");
+        let mut drive = MockDrive::with_root(&fixture.mirror.remote);
+        drive.fail_upload_names.insert("retry.txt".to_owned());
+
+        assert!(sync_push(&fixture.mirror, &fixture.connection, &mut drive).is_err());
+
+        assert!(
+            file_state(&fixture.connection, &fixture.mirror.name, "good.txt")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            file_state(&fixture.connection, &fixture.mirror.name, "retry.txt")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_upload_prevents_remote_cleanup() {
+        let mut fixture = Fixture::new();
+        fixture.mirror.delete = DeletePolicy::Trash;
+        let stale = fixture.write("keep-until-success.txt", "existing");
+        let mut drive = MockDrive::with_root(&fixture.mirror.remote);
+        sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+
+        fs::remove_file(stale).unwrap();
+        fixture.write("retry.txt", "retry later");
+        drive.fail_upload_names.insert("retry.txt".to_owned());
+
+        assert!(sync_push(&fixture.mirror, &fixture.connection, &mut drive).is_err());
+        assert!(drive.trashed.is_empty());
+        assert!(
+            drive
+                .files
+                .contains_key(&format!("{}/keep-until-success.txt", fixture.mirror.remote))
+        );
+    }
+
+    #[test]
+    fn remote_cleanup_uses_bounded_batches() {
+        let mut fixture = Fixture::new();
+        fixture.mirror.delete = DeletePolicy::Trash;
+        let mut paths = Vec::new();
+        for index in 0..(TRASH_BATCH_SIZE + 1) {
+            paths.push(fixture.write(&format!("file-{index:02}.txt"), "content"));
+        }
+        let mut drive = MockDrive::with_root(&fixture.mirror.remote);
+        sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+        for path in paths {
+            fs::remove_file(path).unwrap();
+        }
+        drive.trash_batches.clear();
+
+        let summary = sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+
+        assert_eq!(summary.trashed, TRASH_BATCH_SIZE + 1);
+        assert_eq!(
+            drive.trash_batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![TRASH_BATCH_SIZE, 1]
+        );
+        assert!(
+            all_file_states(&fixture.connection, &fixture.mirror.name)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2033,6 +1543,7 @@ mod tests {
         drive.files.insert(
             format!("{}/remote-only.txt", fixture.mirror.remote),
             RemoteFile {
+                uid: format!("uid:{}/remote-only.txt", fixture.mirror.remote),
                 sha1: "unknown".to_string(),
                 claimed_size: 7,
             },
@@ -2052,6 +1563,7 @@ mod tests {
         drive.files.insert(
             format!("{}/remote-only.txt", fixture.mirror.remote),
             RemoteFile {
+                uid: format!("uid:{}/remote-only.txt", fixture.mirror.remote),
                 sha1: "unknown".to_string(),
                 claimed_size: 7,
             },
@@ -2137,6 +1649,34 @@ mod tests {
         let pushed = sync_two_way(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
         assert_eq!(pushed.uploaded, 1);
         assert_eq!(drive.contents[&remote_path], b"local edit");
+    }
+
+    #[test]
+    fn two_way_rebuilds_the_digest_omitted_by_push() {
+        let mut fixture = Fixture::new();
+        fixture.write("shared.txt", "content");
+        let mut drive = MockDrive::with_root(&fixture.mirror.remote);
+        sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+        assert!(
+            file_state(&fixture.connection, &fixture.mirror.name, "shared.txt")
+                .unwrap()
+                .unwrap()
+                .sha1
+                .is_empty()
+        );
+
+        fixture.mirror.mode = SyncMode::TwoWay;
+        let summary = sync_two_way(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
+
+        assert_eq!(summary.unchanged, 1);
+        assert_eq!(drive.uploads.len(), 1);
+        assert!(
+            !file_state(&fixture.connection, &fixture.mirror.name, "shared.txt")
+                .unwrap()
+                .unwrap()
+                .sha1
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2351,7 +1891,62 @@ printf '{"transferredItems":1,"failedItems":0}\n'
         fs::write(&local, "content").unwrap();
         let mut drive = CliDrive::new(script);
 
-        drive.upload(&local, "/my-files/target").unwrap();
+        drive.upload_many(&[local], "/my-files/target").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_drive_maps_batch_transfer_and_trash_results() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("fake-proton-drive");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+case "$2" in
+    upload)
+        printf '%s\n' '{"transferredItems":1,"transferredBytes":7,"skippedItems":0,"failedItems":1,"failures":[{"name":"retry\nfile.txt","error":"No space"}]}'
+        ;;
+    trash)
+        printf '%s\n' '[{"uid":"one","ok":true},{"uid":"two","ok":false}]'
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let good = temp.path().join("good.txt");
+        let retry = temp.path().join("retry\nfile.txt");
+        fs::write(&good, "content").unwrap();
+        fs::write(&retry, "content").unwrap();
+        let mut drive = CliDrive::new(script);
+
+        let upload = drive
+            .upload_many(&[good, retry], "/my-files/target")
+            .unwrap();
+        let trash = drive
+            .trash_many(&[
+                TrashTarget {
+                    remote_path: "/my-files/one\n".to_owned(),
+                    uid: "one".to_owned(),
+                },
+                TrashTarget {
+                    remote_path: "/my-files/two".to_owned(),
+                    uid: "two".to_owned(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(upload.transferred_items, 1);
+        assert_eq!(upload.transferred_bytes, 7);
+        assert_eq!(upload.failures.len(), 1);
+        assert_eq!(upload.failures[0].name, "retry\nfile.txt");
+        assert_eq!(trash.succeeded_uids, vec!["one"]);
+        assert_eq!(trash.failed_uids, vec!["two"]);
     }
 
     #[test]

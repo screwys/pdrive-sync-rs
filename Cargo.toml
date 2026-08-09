@@ -1,9 +1,10 @@
 [package]
 name = "pdrive-sync-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+authors = ["screwy <screwygit@proton.me>"]
 description = "Sync local folders through Proton Drive's official CLI and SDK"
-license = "GPL-3.0-or-later"
+license = "MIT"
 repository = "https://github.com/screwys/pdrive-sync-rs"
 readme = "README.md"
 

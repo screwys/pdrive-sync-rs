@@ -18,8 +18,9 @@ two-way mode and left alone in one-way modes.
 
 ## Install
 
-First install the [official Proton Drive CLI](https://proton.me/support/drive-cli)
-and log in with its own command:
+First install the [official Proton Drive CLI](https://proton.me/support/drive-cli).
+Version 0.2.0 uses the batch and JSON result API from Proton Drive CLI 0.7.0
+(Proton Drive SDK js@0.20.0). Log in with its own command:
 
 ```sh
 proton-drive auth login
@@ -90,11 +91,17 @@ safe one-off sync with `--local`, `--remote`, `--mode`, and `--delete`.
 
 ## Behavior
 
-The first push inventories the remote tree and hashes local files. Later push
-runs use local checkpoints and compare Proton Drive's active-revision SHA-1
-before replacing anything, so unchanged files are not uploaded again. A failed
-transfer is never checkpointed, and deletions run only after transfers
-succeed.
+Push scans only file metadata locally. New or changed files are sent to the
+Proton Drive CLI in bounded batches; the CLI performs its required hashing and
+automatically skips files whose remote content already matches. Each successful
+batch item is checkpointed immediately, including when another item in the same
+batch fails. Remote cleanup is also batched and begins only after every upload
+batch succeeds.
+
+Pull and two-way sync still verify downloaded content against Proton Drive's
+SHA-1 metadata. A push checkpoint does not store a duplicate locally computed
+SHA-1; if the same entry later changes to two-way mode, its digest is rebuilt
+once before conflict planning.
 
 Symlinks and non-UTF-8 names are skipped or rejected rather than followed.
 Empty directories are not reproduced. Pull and two-way modes inventory the
@@ -102,5 +109,4 @@ remote tree on each run because the CLI does not expose the SDK event stream.
 
 ## License
 
-Licensed under the GNU General Public License,
-version 3 or any later version (`GPL-3.0-or-later`).
+Licensed under the MIT License.
