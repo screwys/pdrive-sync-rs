@@ -1,6 +1,6 @@
 # pdrive-sync
 
-`pdrive-sync` is a simple and lightweight way to orchestrate the official Proton Drive CLI. It adds a scheduled one-way and two-way folder sync layer; it is not another Proton client and
+`pdrive-sync` is a simple and lightweight way to orchestrate the official Proton Drive CLI. It adds a scheduled one-way and two-way folder sync layer as a system service (systemd/dinit/openRC); it is not another Proton client and
 does not implement authentication, or store Proton credentials.
 
 It supports local-to-remote push, remote-to-local pull, and two-way sync.
@@ -18,9 +18,7 @@ two-way mode and left alone in one-way modes.
 
 ## Install
 
-First install the [official Proton Drive CLI](https://proton.me/support/drive-cli).
-Version 0.2.0 uses the batch and JSON result API from Proton Drive CLI 0.7.0
-(Proton Drive SDK js@0.20.0). Log in with its own command:
+First install the [official Proton Drive CLI](https://proton.me/support/drive-cli). This will be kept up-to-date with latest API until the official desktop app is here. 
 
 ```sh
 proton-drive auth login
@@ -52,9 +50,6 @@ pdrive-sync uninstall --init dinit
 ```
 
 The systemd unit also applies a soft `MemoryHigh=512M` cache-reclaim boundary.
-dinit can only join a cgroup created elsewhere, and OpenRC user services do not
-create cgroups, so the installer does not substitute an unsafe hard memory
-limit for those managers.
 
 ## Configuration
 
@@ -103,9 +98,7 @@ SHA-1 metadata. A push checkpoint does not store a duplicate locally computed
 SHA-1; if the same entry later changes to two-way mode, its digest is rebuilt
 once before conflict planning.
 
-Symlinks and non-UTF-8 names are skipped or rejected rather than followed.
-Empty directories are not reproduced. Pull and two-way modes inventory the
-remote tree on each run because the CLI does not expose the SDK event stream.
+Symlinks and non-UTF-8 names are skipped or rejected. Empty directories are not reproduced. Pull and two-way modes inventory the remote tree on each run because the CLI does not expose the SDK event stream.
 
 ## License
 
