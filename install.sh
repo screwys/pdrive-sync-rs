@@ -2,6 +2,20 @@
 # SPDX-License-Identifier: MIT
 set -eu
 
+setup=true
+case "${1:-}" in
+    --no-setup) setup=false ;;
+    --help|-h)
+        printf 'Usage: sh install.sh [--no-setup]\n'
+        exit 0
+        ;;
+    "") ;;
+    *) printf 'pdrive-sync: unknown option: %s\n' "$1" >&2; exit 1 ;;
+esac
+if [ -n "${PDRIVE_SYNC_CURRENT_VERSION:-}" ]; then
+    setup=false
+fi
+
 repository="${PDRIVE_SYNC_REPOSITORY:-screwys/pdrive-sync-rs}"
 install_dir="${PDRIVE_SYNC_INSTALL_DIR:-$HOME/.local/bin}"
 binary="$install_dir/pdrive-sync"
@@ -10,7 +24,7 @@ replacement="$install_dir/.pdrive-sync.$$"
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"; rm -f "$replacement"' EXIT HUP INT TERM
 
-if [ -z "${PDRIVE_SYNC_CURRENT_VERSION:-}" ] && ! (: </dev/tty) 2>/dev/null; then
+if [ "$setup" = true ] && ! (: </dev/tty) 2>/dev/null; then
     printf 'pdrive-sync: installation needs an interactive terminal for setup\n' >&2
     exit 1
 fi
@@ -85,7 +99,7 @@ fi
 rm -f "$legacy_binary"
 
 printf 'Installed %s\n' "$binary"
-if [ -z "${PDRIVE_SYNC_CURRENT_VERSION:-}" ]; then
+if [ "$setup" = true ]; then
     "$binary" setup </dev/tty
     "$binary" install </dev/tty
 fi

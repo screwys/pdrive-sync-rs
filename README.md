@@ -35,6 +35,10 @@ The installer puts `pdrive-sync` in `~/.local/bin`, opens the interactive
 configuration, and installs and starts `pdrive-sync.service`. It detects a
 systemd, dinit, or OpenRC user service manager automatically.
 
+For a restore that supplies its own saved configuration and services, run
+`sh install.sh --no-setup`. This installs the executable without interactive
+setup or starting a service.
+
 Use `pdrive-sync restart` to restart the installed service, or
 `pdrive-sync update` to replace the current executable with the latest release.
 
