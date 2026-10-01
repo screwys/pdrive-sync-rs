@@ -13,6 +13,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -222,8 +224,25 @@ fn run_sync(config_path: &Path, args: SyncArgs) -> Result<()> {
     };
 
     validate_config(&config)?;
-    optimize_cli_cache(&config)?;
     let (database_path, success_path) = resolved_state_paths(&config)?;
+    #[cfg(unix)]
+    let _sync_lock = {
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(database_path.with_extension("lock"))?;
+        // Keep the descriptor open until this run finishes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("could not lock sync state");
+        }
+        file
+    };
+    optimize_cli_cache(&config)?;
     let connection = open_database(&database_path)?;
     let mut drive = CliDrive::new(config.proton_drive_bin.clone());
     let summaries = match sync_all(&config, &connection, &mut drive) {

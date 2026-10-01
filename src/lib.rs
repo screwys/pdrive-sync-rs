@@ -237,6 +237,13 @@ pub fn sync_push(
     }
     execute_uploads(mirror, connection, drive, uploads, &mut summary)?;
 
+    // Uploads can take long enough for local files to be added or removed.
+    require_ready(mirror)?;
+    let (current_files, _) = scan_local_files(mirror, &excludes)?;
+    seen = current_files
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
     let stale = stale_paths(connection, &mirror.name, &seen)?;
     if mirror.delete == DeletePolicy::Trash {
         if remote_tree.is_none() && !stale.is_empty() {

@@ -97,6 +97,10 @@ batch item is checkpointed immediately, including when another item in the same
 batch fails. Remote cleanup is also batched and begins only after every upload
 batch succeeds.
 
+Runs using the same state database wait for each other. Push cleanup checks
+the local file list again after uploads, so files added during a long upload
+are kept on Proton Drive.
+
 Pull and two-way sync still verify downloaded content against Proton Drive's
 SHA-1 metadata. A push checkpoint does not store a duplicate locally computed
 SHA-1; if the same entry later changes to two-way mode, its digest is rebuilt
