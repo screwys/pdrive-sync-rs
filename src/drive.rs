@@ -610,10 +610,19 @@ fn literal_upload_path(path: &str) -> String {
     }
     let mut escaped = String::with_capacity(path.len());
     for character in path.chars() {
-        if "\\*?[]{}()!+@".contains(character) {
-            escaped.push('\\');
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            '{' => escaped.push_str("[{]"),
+            '(' => escaped.push_str("[(]"),
+            ')' => escaped.push_str("[)]"),
+            '+' => escaped.push_str("[+]"),
+            '@' => escaped.push_str("[@]"),
+            '!' => escaped.push_str("[\\!]"),
+            '\\' => escaped.push_str("[\\\\]"),
+            _ => escaped.push(character),
         }
-        escaped.push(character);
     }
     escaped
 }
