@@ -229,12 +229,10 @@ impl DriveClient for CliDrive {
         ];
         let mut expected_names = BTreeSet::new();
         for local_path in local_paths {
-            args.push(
-                local_path
-                    .to_str()
-                    .context("local upload path is not valid UTF-8")?
-                    .to_owned(),
-            );
+            let local = local_path
+                .to_str()
+                .context("local upload path is not valid UTF-8")?;
+            args.push(literal_upload_path(local));
             let name = local_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -603,6 +601,21 @@ pub(crate) fn quote_repl_argument(argument: &str) -> String {
         "\"{}\"",
         argument.replace('\\', "\\\\").replace('"', "\\\"")
     )
+}
+
+fn literal_upload_path(path: &str) -> String {
+    // The CLI expands local globs after parsing command arguments.
+    if !path.contains(['*', '?', '[', '{']) {
+        return path.to_owned();
+    }
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if "\\*?[]{}()!+@".contains(character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn transient_read_failure(message: &str) -> bool {
