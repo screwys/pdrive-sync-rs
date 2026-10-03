@@ -4,7 +4,7 @@ use crate::Config;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -100,6 +100,7 @@ pub trait DriveClient {
 pub struct CliDrive {
     binary: PathBuf,
     session: Option<ReplSession>,
+    directory_paths: BTreeMap<String, String>,
 }
 
 impl CliDrive {
@@ -107,6 +108,7 @@ impl CliDrive {
         Self {
             binary,
             session: None,
+            directory_paths: BTreeMap::new(),
         }
     }
 
@@ -115,6 +117,28 @@ impl CliDrive {
             self.session = Some(ReplSession::start(&self.binary)?);
         }
         Ok(self.session.as_mut().expect("session was initialized"))
+    }
+
+    fn directory_argument(&self, path: &str) -> String {
+        let mut prefix = path;
+        loop {
+            if let Some(direct) = self.directory_paths.get(prefix) {
+                return format!("{direct}{}", &path[prefix.len()..]);
+            }
+            let Some(index) = prefix.rfind('/') else {
+                return path.to_owned();
+            };
+            prefix = &prefix[..index];
+        }
+    }
+
+    fn remember_directory(&mut self, path: &str, node: &RemoteNode) {
+        if node.kind == "folder" && path.starts_with("/my-files/") {
+            self.directory_paths.insert(
+                path.trim_end_matches('/').to_owned(),
+                format!("/my-files/{}", node.uid),
+            );
+        }
     }
 
     fn read_json(&mut self, args: &[&str]) -> Result<Vec<u8>> {
@@ -168,7 +192,8 @@ impl CliDrive {
 
 impl DriveClient for CliDrive {
     fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>> {
-        let output = self.read_json(&["filesystem", "list", "-j", remote_path])?;
+        let directory = self.directory_argument(remote_path);
+        let output = self.read_json(&["filesystem", "list", "-j", &directory])?;
         serde_json::from_slice(&output).context("invalid JSON from Proton Drive list")
     }
 
@@ -176,16 +201,27 @@ impl DriveClient for CliDrive {
         const ATTEMPTS: usize = 3;
 
         for attempt in 1..=ATTEMPTS {
-            let args = ["filesystem", "info", "-j", remote_path];
+            let directory = self.directory_argument(remote_path);
+            let args = ["filesystem", "info", "-j", &directory];
             let response = if repl_arguments_supported(&args) {
                 self.session()?.command(&args)?
             } else {
                 self.one_shot(&args)?
             };
             if !response.output.is_empty() {
-                return serde_json::from_slice(&response.output)
-                    .context("invalid JSON from Proton Drive info")
-                    .map(Some);
+                let value: serde_json::Value = serde_json::from_slice(&response.output)
+                    .context("invalid JSON from Proton Drive info")?;
+                let node =
+                    serde_json::from_value(value.clone()).context("invalid Proton Drive node")?;
+                self.remember_directory(remote_path, &node);
+                if remote_path.starts_with("/my-files/")
+                    && let Some(parent_uid) = value.get("parentUid").and_then(|uid| uid.as_str())
+                    && let Some((parent, _)) = remote_path.rsplit_once('/')
+                {
+                    self.directory_paths
+                        .insert(parent.to_owned(), format!("/my-files/{parent_uid}"));
+                }
+                return Ok(Some(node));
             }
 
             let message = response.error;
@@ -205,9 +241,15 @@ impl DriveClient for CliDrive {
     }
 
     fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()> {
-        let output = self.write_json(&["filesystem", "create-folder", "-j", parent_path, name])?;
-        serde_json::from_slice::<RemoteNode>(&output)
+        let directory = self.directory_argument(parent_path);
+        let output = self.write_json(&["filesystem", "create-folder", "-j", &directory, name])?;
+        let node = serde_json::from_slice::<RemoteNode>(&output)
             .context("invalid JSON from Proton Drive create-folder")?;
+        let child = name.replace('\\', "\\\\").replace('/', "\\/");
+        self.remember_directory(
+            &format!("{}/{child}", parent_path.trim_end_matches('/')),
+            &node,
+        );
         Ok(())
     }
 
@@ -241,7 +283,7 @@ impl DriveClient for CliDrive {
                 bail!("upload batch contains duplicate file name {name:?}");
             }
         }
-        args.push(remote_parent.to_owned());
+        args.push(self.directory_argument(remote_parent));
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.write_json(&arg_refs)?;
         let summary: TransferSummary =
