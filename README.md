@@ -89,15 +89,6 @@ Run selected entries with `pdrive-sync sync documents photos`, or describe a
 safe one-off sync with `--local`, `--remote`, `--mode`, and `--delete`.
 `pdrive-sync config validate` checks the file.
 
-The SDK helper defaults to the executable next to `pdrive-sync`. Set `sdk_bin`
-in the configuration, or `sync --sdk-bin PATH` for a one-off run, to override it.
-SDK caches are separate from the CLI's caches, under
-`$XDG_CACHE_HOME/pdrive-sync-sdk` or `~/.cache/pdrive-sync-sdk`.
-`PDRIVE_SYNC_SDK_CACHE_DIR` overrides that location. The SDK client identity lives
-under `$XDG_DATA_HOME/pdrive-sync-sdk` or `~/.local/share/pdrive-sync-sdk`, so clearing
-caches does not change upload draft ownership. Credentials still use the CLI's
-configured keyring, pass store, or portable credentials directory.
-
 ## Build
 
 Install Rust and Bun 1.4.2, then run:
@@ -106,12 +97,6 @@ Install Rust and Bun 1.4.2, then run:
 sdk/build.sh
 cargo build --locked
 ```
-
-The SDK build downloads the pinned Proton sources and dependencies into `target`.
-It produces `target/debug/pdrive-sync-sdk` beside the Rust executable.
-For release builds, use `SDK_OUTPUT_DIR=target/release sdk/build.sh` and
-`cargo build --locked --release`.
-
 ## Behavior
 
 Remote discovery uses node IDs. The first run inventories the included remote
