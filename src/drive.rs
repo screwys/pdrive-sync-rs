@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: MIT
 
-use crate::Config;
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultValue<T> {
     pub ok: bool,
     pub value: Option<T>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteNode {
     pub uid: String,
+    #[serde(default)]
+    pub parent_uid: Option<String>,
+    #[serde(default)]
+    pub tree_event_scope_id: Option<String>,
     pub name: ResultValue<String>,
     #[serde(rename = "type")]
     pub kind: String,
@@ -31,589 +31,250 @@ pub struct RemoteNode {
     pub active_revision: Option<RemoteRevision>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteRevision {
     pub uid: String,
-    pub storage_size: u64,
-    pub claimed_size: u64,
+    pub storage_size: Option<u64>,
+    pub claimed_size: Option<u64>,
     pub claimed_modification_time: Option<String>,
-    pub claimed_digests: RemoteDigests,
+    pub claimed_digests: Option<RemoteDigests>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteDigests {
-    pub sha1: String,
+    pub sha1: Option<String>,
     pub sha1_verified: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RemoteFile {
     pub uid: String,
+    pub revision_uid: String,
     pub sha1: String,
     pub claimed_size: u64,
 }
 
 #[derive(Clone, Debug)]
+pub struct RemoteParent {
+    pub uid: String,
+    pub root: String,
+    pub components: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalUpload {
+    pub path: PathBuf,
+    pub sha1: Option<String>,
+    pub expected_remote: Option<RemoteVersion>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RemoteVersion {
+    Absent,
+    Revision {
+        uid: String,
+        #[serde(rename = "revisionUid")]
+        revision_uid: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct UploadFailure {
     pub name: String,
     pub error: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBatchResult {
     pub transferred_items: usize,
     pub skipped_items: usize,
     pub transferred_bytes: u64,
     pub failures: Vec<UploadFailure>,
+    #[serde(default)]
+    pub nodes: Vec<RemoteNode>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TrashTarget {
-    pub remote_path: String,
+    pub parent: RemoteParent,
+    pub name: String,
     pub uid: String,
+    pub revision_uid: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TrashBatchResult {
     pub succeeded_uids: Vec<String>,
     pub failed_uids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub node_uid: Option<String>,
+    pub parent_node_uid: Option<String>,
+    pub is_trashed: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RemoteEvents {
+    pub cursor: String,
+    pub events: Vec<RemoteEvent>,
+    pub refresh: bool,
+    pub removed: bool,
+}
+
 pub trait DriveClient {
+    fn reset_cache(&mut self) -> Result<()>;
+    fn child(&mut self, parent_uid: &str, name: &str) -> Result<Option<RemoteNode>>;
     fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>>;
     fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>>;
-    fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()>;
+    fn events(&mut self, scope: &str, cursor: Option<&str>) -> Result<RemoteEvents>;
+    fn create_folder(&mut self, parent: &RemoteParent, name: &str) -> Result<RemoteNode>;
     fn upload_many(
         &mut self,
-        local_paths: &[PathBuf],
-        remote_parent: &str,
+        files: &[LocalUpload],
+        remote_parent: &RemoteParent,
     ) -> Result<UploadBatchResult>;
-    fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()>;
+    fn download(&mut self, remote: &RemoteFile, local_parent: &Path) -> Result<()>;
     fn trash_many(&mut self, targets: &[TrashTarget]) -> Result<TrashBatchResult>;
-    fn release_session(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
-pub struct CliDrive {
+pub struct SdkDrive {
     binary: PathBuf,
-    session: Option<ReplSession>,
-    directory_paths: BTreeMap<String, String>,
+    session: Option<SdkSession>,
 }
 
-impl CliDrive {
+impl SdkDrive {
     pub fn new(binary: PathBuf) -> Self {
         Self {
             binary,
             session: None,
-            directory_paths: BTreeMap::new(),
         }
     }
 
-    fn session(&mut self) -> Result<&mut ReplSession> {
+    fn request<T: DeserializeOwned>(&mut self, request: serde_json::Value) -> Result<T> {
         if self.session.is_none() {
-            self.session = Some(ReplSession::start(&self.binary)?);
+            self.session = Some(SdkSession::start(&self.binary)?);
         }
-        Ok(self.session.as_mut().expect("session was initialized"))
-    }
-
-    fn directory_argument(&self, path: &str) -> String {
-        let mut prefix = path;
-        loop {
-            if let Some(direct) = self.directory_paths.get(prefix) {
-                return format!("{direct}{}", &path[prefix.len()..]);
-            }
-            let Some(index) = prefix.rfind('/') else {
-                return path.to_owned();
-            };
-            prefix = &prefix[..index];
-        }
-    }
-
-    fn remember_directory(&mut self, path: &str, node: &RemoteNode) {
-        if node.kind == "folder" && path.starts_with("/my-files/") {
-            self.directory_paths.insert(
-                path.trim_end_matches('/').to_owned(),
-                format!("/my-files/{}", node.uid),
-            );
-        }
-    }
-
-    fn read_json(&mut self, args: &[&str]) -> Result<Vec<u8>> {
-        const ATTEMPTS: usize = 3;
-
-        for attempt in 1..=ATTEMPTS {
-            let response = if repl_arguments_supported(args) {
-                self.session()?.command(args)?
-            } else {
-                self.one_shot(args)?
-            };
-            if !response.output.is_empty() {
-                return Ok(response.output);
-            }
-            if attempt < ATTEMPTS && transient_read_failure(&response.error) {
-                eprintln!(
-                    "[pdrive-sync] Proton Drive read failed transiently; retrying ({attempt}/{ATTEMPTS})"
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            bail!("Proton Drive CLI command failed: {}", response.error);
-        }
-        unreachable!()
-    }
-
-    fn write_json(&mut self, args: &[&str]) -> Result<Vec<u8>> {
-        let response = if repl_arguments_supported(args) {
-            self.session()?.command(args)?
-        } else {
-            self.one_shot(args)?
-        };
-        if response.output.is_empty() {
-            bail!("Proton Drive CLI command failed: {}", response.error);
-        }
-        Ok(response.output)
-    }
-
-    fn one_shot(&mut self, args: &[&str]) -> Result<ReplResponse> {
-        drop(self.session.take());
-        let output = Command::new(&self.binary)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run {}", self.binary.display()))?;
-        Ok(ReplResponse {
-            output: output.stdout,
-            error: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+        self.session
+            .as_mut()
+            .expect("session was initialized")
+            .request(request)
     }
 }
 
-impl DriveClient for CliDrive {
+impl DriveClient for SdkDrive {
+    fn reset_cache(&mut self) -> Result<()> {
+        self.request(json!({"method":"reset_cache"}))
+    }
+
+    fn child(&mut self, parent_uid: &str, name: &str) -> Result<Option<RemoteNode>> {
+        self.request(json!({"method":"child", "parent":parent_uid, "name":name}))
+    }
+
     fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>> {
-        let directory = self.directory_argument(remote_path);
-        let output = self.read_json(&["filesystem", "list", "-j", &directory])?;
-        serde_json::from_slice(&output).context("invalid JSON from Proton Drive list")
+        self.request(json!({"method":"list", "path":remote_path}))
     }
 
     fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>> {
-        const ATTEMPTS: usize = 3;
-
-        for attempt in 1..=ATTEMPTS {
-            let directory = self.directory_argument(remote_path);
-            let args = ["filesystem", "info", "-j", &directory];
-            let response = if repl_arguments_supported(&args) {
-                self.session()?.command(&args)?
-            } else {
-                self.one_shot(&args)?
-            };
-            if !response.output.is_empty() {
-                let value: serde_json::Value = serde_json::from_slice(&response.output)
-                    .context("invalid JSON from Proton Drive info")?;
-                let node =
-                    serde_json::from_value(value.clone()).context("invalid Proton Drive node")?;
-                self.remember_directory(remote_path, &node);
-                if remote_path.starts_with("/my-files/")
-                    && let Some(parent_uid) = value.get("parentUid").and_then(|uid| uid.as_str())
-                    && let Some((parent, _)) = remote_path.rsplit_once('/')
-                {
-                    self.directory_paths
-                        .insert(parent.to_owned(), format!("/my-files/{parent_uid}"));
-                }
-                return Ok(Some(node));
-            }
-
-            let message = response.error;
-            if message.starts_with("Node not found:") {
-                return Ok(None);
-            }
-            if attempt < ATTEMPTS && transient_read_failure(&message) {
-                eprintln!(
-                    "[pdrive-sync] Proton Drive read failed transiently; retrying ({attempt}/{ATTEMPTS})"
-                );
-                thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            bail!("Proton Drive CLI command failed: {message}");
-        }
-        unreachable!()
+        self.request(json!({"method":"info", "path":remote_path}))
     }
 
-    fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()> {
-        let directory = self.directory_argument(parent_path);
-        let output = self.write_json(&["filesystem", "create-folder", "-j", &directory, name])?;
-        let node = serde_json::from_slice::<RemoteNode>(&output)
-            .context("invalid JSON from Proton Drive create-folder")?;
-        let child = name.replace('\\', "\\\\").replace('/', "\\/");
-        self.remember_directory(
-            &format!("{}/{child}", parent_path.trim_end_matches('/')),
-            &node,
-        );
-        Ok(())
+    fn events(&mut self, scope: &str, cursor: Option<&str>) -> Result<RemoteEvents> {
+        self.request(json!({"method": "events", "scope": scope, "cursor": cursor}))
+    }
+
+    fn create_folder(&mut self, parent: &RemoteParent, name: &str) -> Result<RemoteNode> {
+        self.request(json!({"method":"create_folder", "parent":parent.uid, "root":parent.root, "parentComponents":parent.components, "name":name}))
     }
 
     fn upload_many(
         &mut self,
-        local_paths: &[PathBuf],
-        remote_parent: &str,
+        files: &[LocalUpload],
+        remote_parent: &RemoteParent,
     ) -> Result<UploadBatchResult> {
-        if local_paths.is_empty() {
-            return Ok(UploadBatchResult::default());
-        }
-        let mut args = vec![
-            "filesystem".to_owned(),
-            "upload".to_owned(),
-            "-j".to_owned(),
-            "--file-conflict-strategy".to_owned(),
-            "replace".to_owned(),
-            "--skip-thumbnails".to_owned(),
-        ];
-        let mut expected_names = BTreeSet::new();
-        for local_path in local_paths {
-            let local = local_path
-                .to_str()
-                .context("local upload path is not valid UTF-8")?;
-            args.push(literal_upload_path(local));
-            let name = local_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("local upload path has no UTF-8 file name")?;
-            if !expected_names.insert(name.to_owned()) {
-                bail!("upload batch contains duplicate file name {name:?}");
-            }
-        }
-        args.push(self.directory_argument(remote_parent));
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = self.write_json(&arg_refs)?;
-        let summary: TransferSummary =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive upload")?;
-        if summary.failed_items != summary.failures.len()
-            || summary.transferred_items + summary.skipped_items + summary.failed_items
-                != local_paths.len()
-        {
-            bail!(
-                "Proton Drive upload returned inconsistent counts for {} files: transferred={} skipped={} failed={} failure_details={}",
-                local_paths.len(),
-                summary.transferred_items,
-                summary.skipped_items,
-                summary.failed_items,
-                summary.failures.len()
-            );
-        }
-        let mut failure_names = BTreeSet::new();
-        for failure in &summary.failures {
-            if !expected_names.contains(&failure.name) {
-                bail!(
-                    "Proton Drive upload reported failure for unknown file {:?}",
-                    failure.name
-                );
-            }
-            if !failure_names.insert(failure.name.clone()) {
-                bail!(
-                    "Proton Drive upload reported duplicate failure for {:?}",
-                    failure.name
-                );
-            }
-        }
-        Ok(UploadBatchResult {
-            transferred_items: summary.transferred_items,
-            skipped_items: summary.skipped_items,
-            transferred_bytes: summary.transferred_bytes,
-            failures: summary
-                .failures
-                .into_iter()
-                .map(|failure| UploadFailure {
-                    name: failure.name,
-                    error: failure.error,
-                })
-                .collect(),
-        })
+        let parent = remote_parent;
+        let files = files
+            .iter()
+            .map(|file| json!({"path": file.path, "sha1": file.sha1, "expectedRemote": file.expected_remote}))
+            .collect::<Vec<_>>();
+        self.request(json!({"method": "upload", "parent": parent.uid, "root":parent.root, "parentComponents":parent.components, "files": files}))
     }
 
-    fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()> {
-        let local_parent = local_parent
-            .to_str()
-            .context("local download path is not valid UTF-8")?;
-        let output = self.write_json(&[
-            "filesystem",
-            "download",
-            "-j",
-            "--file-conflict-strategy",
-            "replace",
-            remote_path,
-            local_parent,
-        ])?;
-        let summary: TransferSummary =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive download")?;
-        if summary.failed_items != 0 || summary.transferred_items != 1 {
-            bail!(
-                "Proton Drive download reported transferred={} failed={}",
-                summary.transferred_items,
-                summary.failed_items
-            );
-        }
-        Ok(())
+    fn download(&mut self, remote: &RemoteFile, local_parent: &Path) -> Result<()> {
+        self.request(
+            json!({"method": "download", "path": remote.uid, "revisionUid": remote.revision_uid,
+            "parent": local_parent, "sha1": remote.sha1, "size": remote.claimed_size}),
+        )
     }
 
     fn trash_many(&mut self, targets: &[TrashTarget]) -> Result<TrashBatchResult> {
-        if targets.is_empty() {
-            return Ok(TrashBatchResult::default());
-        }
-        let mut args = vec!["filesystem".to_owned(), "trash".to_owned(), "-j".to_owned()];
-        let mut expected_uids = BTreeSet::new();
-        for target in targets {
-            args.push(target.remote_path.clone());
-            if !expected_uids.insert(target.uid.clone()) {
-                bail!("trash batch contains duplicate node UID");
-            }
-        }
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = self.write_json(&arg_refs)?;
-        let results: Vec<OperationResult> =
-            serde_json::from_slice(&output).context("invalid JSON from Proton Drive trash")?;
-        if results.len() != targets.len() {
-            bail!(
-                "Proton Drive trash returned {} results for {} targets",
-                results.len(),
-                targets.len()
-            );
-        }
-        let mut returned_uids = BTreeSet::new();
-        let mut outcome = TrashBatchResult::default();
-        for result in results {
-            if !expected_uids.contains(&result.uid) {
-                bail!("Proton Drive trash returned an unknown node UID");
-            }
-            if !returned_uids.insert(result.uid.clone()) {
-                bail!("Proton Drive trash returned a duplicate node UID");
-            }
-            if result.ok {
-                outcome.succeeded_uids.push(result.uid);
-            } else {
-                outcome.failed_uids.push(result.uid);
-            }
-        }
-        Ok(outcome)
-    }
-
-    fn release_session(&mut self) -> Result<()> {
-        drop(self.session.take());
-        release_cli_cache_pages();
-        Ok(())
+        let targets = targets
+            .iter()
+            .map(|target| json!({"uid": target.uid, "revisionUid":target.revision_uid, "parentUid":target.parent.uid, "name":target.name, "root":target.parent.root, "parentComponents":target.parent.components}))
+            .collect::<Vec<_>>();
+        self.request(json!({"method": "trash", "targets": targets}))
     }
 }
 
-pub fn optimize_cli_cache(config: &Config) -> Result<usize> {
-    if !config.optimize_cli_cache {
-        return Ok(0);
-    }
-    let cache_dir = proton_cli_cache_dir()?;
-    optimize_cli_cache_dir(&cache_dir)
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SdkResponse<T> {
+    Value(T),
+    Error(String),
 }
 
-fn proton_cli_cache_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("PROTON_DRIVE_CACHE_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(path).join("proton-drive-cli"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cache").join("proton-drive-cli"))
-}
-
-fn release_cli_cache_pages() {
-    #[cfg(target_os = "linux")]
-    if let Ok(cache_dir) = proton_cli_cache_dir() {
-        for name in [
-            "cache-entities.sqlite",
-            "cache-entities.sqlite-wal",
-            "cache-crypto.sqlite",
-            "cache-crypto.sqlite-wal",
-        ] {
-            let Ok(file) = File::open(cache_dir.join(name)) else {
-                continue;
-            };
-            use std::os::fd::AsRawFd;
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
-        }
-    }
-}
-
-pub fn optimize_cli_cache_dir(cache_dir: &Path) -> Result<usize> {
-    let mut optimized = 0;
-    for name in ["cache-entities.sqlite", "cache-crypto.sqlite"] {
-        let path = cache_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        let connection = Connection::open(&path)
-            .with_context(|| format!("failed to open Proton Drive cache {}", path.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        let mode: String = connection
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .with_context(|| format!("failed to enable WAL for {}", path.display()))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            bail!(
-                "Proton Drive cache {} rejected WAL mode: {mode}",
-                path.display()
-            );
-        }
-        optimized += 1;
-    }
-    Ok(optimized)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TransferSummary {
-    transferred_items: usize,
-    #[serde(default)]
-    transferred_bytes: u64,
-    #[serde(default)]
-    skipped_items: usize,
-    failed_items: usize,
-    #[serde(default)]
-    failures: Vec<TransferFailure>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TransferFailure {
-    name: String,
-    error: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OperationResult {
-    uid: String,
-    ok: bool,
-}
-
-struct ReplResponse {
-    output: Vec<u8>,
-    error: String,
-}
-
-struct ReplSession {
+struct SdkSession {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    errors: Receiver<String>,
 }
 
-impl ReplSession {
-    const PROMPT: &'static [u8] = b"proton-drive> ";
-
+impl SdkSession {
     fn start(binary: &Path) -> Result<Self> {
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to start {} REPL", binary.display()))?;
-        let input = child
-            .stdin
-            .take()
-            .context("Proton Drive REPL has no stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("Proton Drive REPL has no stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Proton Drive REPL has no stderr")?;
-        let (error_sender, errors) = mpsc::channel();
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(std::result::Result::ok) {
-                let _ = error_sender.send(line);
-            }
-        });
-
-        let mut session = Self {
+            .with_context(|| format!("failed to start SDK helper {}", binary.display()))?;
+        let input = child.stdin.take().context("SDK helper has no stdin")?;
+        let stdout = child.stdout.take().context("SDK helper has no stdout")?;
+        Ok(Self {
             child,
             input,
             output: BufReader::new(stdout),
-            errors,
-        };
-        let startup = session.read_to_prompt()?;
-        if !startup.is_empty() {
-            bail!(
-                "unexpected output while starting Proton Drive REPL: {}",
-                String::from_utf8_lossy(&startup).trim()
-            );
-        }
-        Ok(session)
-    }
-
-    fn command(&mut self, args: &[&str]) -> Result<ReplResponse> {
-        while self.errors.try_recv().is_ok() {}
-        reject_repl_newlines(args)?;
-        let command = args
-            .iter()
-            .map(|argument| quote_repl_argument(argument))
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.input.write_all(command.as_bytes())?;
-        self.input.write_all(b"\n")?;
-        self.input.flush()?;
-
-        let output = self.read_to_prompt()?;
-        let mut error_lines = Vec::new();
-        if output.is_empty()
-            && let Ok(line) = self.errors.recv_timeout(Duration::from_millis(100))
-        {
-            error_lines.push(line);
-        }
-        error_lines.extend(self.errors.try_iter());
-        Ok(ReplResponse {
-            output,
-            error: error_lines.join("\n"),
         })
     }
 
-    fn read_to_prompt(&mut self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        loop {
-            let available = self.output.fill_buf()?;
-            if available.is_empty() {
-                let status = self.child.try_wait()?;
-                let error = self.errors.try_iter().collect::<Vec<_>>().join("\n");
-                bail!(
-                    "Proton Drive REPL closed unexpectedly{}{}",
-                    status.map_or_else(String::new, |value| format!(" with {value}")),
-                    if error.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {error}")
-                    }
-                );
-            }
-            let byte = available[0];
-            self.output.consume(1);
-            bytes.push(byte);
-
-            if bytes == Self::PROMPT {
-                bytes.clear();
-                return Ok(bytes);
-            }
-            if bytes.ends_with(Self::PROMPT)
-                && bytes.get(bytes.len().saturating_sub(Self::PROMPT.len() + 1)) == Some(&b'\n')
-            {
-                bytes.truncate(bytes.len() - Self::PROMPT.len() - 1);
-                return Ok(bytes);
-            }
+    fn request<T: DeserializeOwned>(&mut self, request: serde_json::Value) -> Result<T> {
+        serde_json::to_writer(&mut self.input, &request)?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        let mut response = String::new();
+        if self.output.read_line(&mut response)? == 0 {
+            bail!("SDK helper closed unexpectedly");
+        }
+        match serde_json::from_str::<SdkResponse<T>>(&response)
+            .context("invalid SDK helper response")?
+        {
+            SdkResponse::Value(value) => Ok(value),
+            SdkResponse::Error(error) => bail!("Proton Drive SDK: {error}"),
         }
     }
 }
 
-impl Drop for ReplSession {
+impl Drop for SdkSession {
     fn drop(&mut self) {
-        let _ = self.input.write_all(b"exit\n");
+        let _ = self.input.write_all(b"{\"method\":\"exit\"}\n");
         let _ = self.input.flush();
         for _ in 0..20 {
             match self.child.try_wait() {
@@ -625,52 +286,4 @@ impl Drop for ReplSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-pub(crate) fn reject_repl_newlines(args: &[&str]) -> Result<()> {
-    if !repl_arguments_supported(args) {
-        bail!("Proton Drive REPL arguments cannot contain newlines");
-    }
-    Ok(())
-}
-
-fn repl_arguments_supported(args: &[&str]) -> bool {
-    !args.iter().any(|argument| argument.contains(['\n', '\r']))
-}
-
-pub(crate) fn quote_repl_argument(argument: &str) -> String {
-    format!(
-        "\"{}\"",
-        argument.replace('\\', "\\\\").replace('"', "\\\"")
-    )
-}
-
-fn literal_upload_path(path: &str) -> String {
-    // The CLI expands local globs after parsing command arguments.
-    if !path.contains(['*', '?', '[', '{']) {
-        return path.to_owned();
-    }
-    let mut escaped = String::with_capacity(path.len());
-    for character in path.chars() {
-        match character {
-            '*' => escaped.push_str("[*]"),
-            '?' => escaped.push_str("[?]"),
-            '[' => escaped.push_str("[[]"),
-            '{' => escaped.push_str("[{]"),
-            '(' => escaped.push_str("[(]"),
-            ')' => escaped.push_str("[)]"),
-            '+' => escaped.push_str("[+]"),
-            '@' => escaped.push_str("[@]"),
-            '!' => escaped.push_str("[\\!]"),
-            '\\' => escaped.push_str("[\\\\]"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn transient_read_failure(message: &str) -> bool {
-    message.contains("You need to login first")
-        || message.contains("SQLITE_BUSY")
-        || message.contains("database is locked")
 }

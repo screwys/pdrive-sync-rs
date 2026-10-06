@@ -12,6 +12,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: sdk/build.sh
+      - name: Check SDK helper protocol
+        run: |
+          target/debug/pdrive-sync-sdk --version
+          printf '%s\n' '{"method":"exit"}' | target/debug/pdrive-sync-sdk
       - run: rustup toolchain install stable --profile minimal
       - run: cargo fmt --check
       - run: cargo test --locked

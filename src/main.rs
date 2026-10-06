@@ -4,9 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Confirm, Input, Select};
 use pdrive_sync::{
-    CliDrive, Config, ConflictPolicy, DeletePolicy, SyncConfig, SyncMode, default_config_path,
-    load_config, open_database, optimize_cli_cache, resolved_state_paths, sync_all,
-    validate_config, write_success_file,
+    Config, ConflictPolicy, DeletePolicy, SdkDrive, SyncConfig, SyncMode, default_config_path,
+    default_sdk_bin, load_config, open_database, resolved_state_paths, sync_all, validate_config,
+    write_success_file,
 };
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
@@ -29,7 +29,7 @@ const INSTALLER_SCRIPT: &str = include_str!("../install.sh");
 #[command(
     name = "pdrive-sync",
     version,
-    about = "Sync local folders through Proton Drive's official CLI and SDK"
+    about = "Sync local folders through Proton Drive's official SDK"
 )]
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
@@ -80,9 +80,9 @@ struct SyncArgs {
     delete: DeletePolicy,
     #[arg(long, value_enum, default_value = "fail")]
     conflict: ConflictPolicy,
-    /// Proton Drive CLI executable or absolute path.
-    #[arg(long, default_value = "proton-drive")]
-    proton_drive: PathBuf,
+    /// Proton Drive SDK helper executable or absolute path.
+    #[arg(long, default_value_os_t = default_sdk_bin())]
+    sdk_bin: PathBuf,
     /// Do not send a desktop notification when no sync has succeeded for 24 hours.
     #[arg(long)]
     no_notifications: bool,
@@ -97,7 +97,7 @@ impl Default for SyncArgs {
             mode: SyncMode::Push,
             delete: DeletePolicy::Keep,
             conflict: ConflictPolicy::Fail,
-            proton_drive: PathBuf::from("proton-drive"),
+            sdk_bin: default_sdk_bin(),
             no_notifications: false,
         }
     }
@@ -184,8 +184,7 @@ fn run_sync(config_path: &Path, args: SyncArgs) -> Result<()> {
     let config = if let (Some(local), Some(remote)) = (args.local, args.remote) {
         let name = one_off_name(&local, &remote, args.mode);
         Config {
-            proton_drive_bin: args.proton_drive,
-            optimize_cli_cache: true,
+            sdk_bin: args.sdk_bin,
             notifications: true,
             state_db: None,
             success_file: None,
@@ -242,9 +241,8 @@ fn run_sync(config_path: &Path, args: SyncArgs) -> Result<()> {
         }
         file
     };
-    optimize_cli_cache(&config)?;
     let connection = open_database(&database_path)?;
-    let mut drive = CliDrive::new(config.proton_drive_bin.clone());
+    let mut drive = SdkDrive::new(config.sdk_bin.clone());
     let summaries = match sync_all(&config, &connection, &mut drive) {
         Ok(summaries) => summaries,
         Err(error) => {
@@ -292,9 +290,9 @@ fn setup(config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let proton_drive_bin = Input::<String>::new()
-        .with_prompt("Proton Drive CLI executable")
-        .default("proton-drive".to_owned())
+    let sdk_bin = Input::<String>::new()
+        .with_prompt("Proton Drive SDK helper executable")
+        .default(default_sdk_bin().to_string_lossy().into_owned())
         .interact_text()?;
     let name = Input::<String>::new()
         .with_prompt("Sync name")
@@ -340,8 +338,7 @@ fn setup(config_path: &Path) -> Result<()> {
         .allow_empty(true)
         .interact_text()?;
     let config = Config {
-        proton_drive_bin: PathBuf::from(proton_drive_bin),
-        optimize_cli_cache: true,
+        sdk_bin: PathBuf::from(sdk_bin),
         notifications: true,
         state_db: None,
         success_file: None,

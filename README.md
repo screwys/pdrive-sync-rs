@@ -1,7 +1,9 @@
 # pdrive-sync
 
-`pdrive-sync` is a simple and lightweight way to orchestrate the official Proton Drive CLI. It adds a scheduled one-way and two-way folder sync layer as a system service (systemd/dinit/openRC); it is not another Proton client and
-does not implement authentication, or store Proton credentials.
+`pdrive-sync` syncs local folders through the official Proton Drive SDK.
+A bundled SDK helper handles authentication, encryption, caching, remote events,
+and transfers. The Rust service applies folder sync and conflict policies.
+It reuses the Proton Drive CLI's login from the configured credentials store.
 
 It supports local-to-remote push, remote-to-local pull, and two-way sync.
 Deletion is opt-in: `delete = "trash"` moves removed files to Proton Drive
@@ -18,22 +20,23 @@ two-way mode and left alone in one-way modes.
 
 ## Install
 
-First install the [official Proton Drive CLI](https://proton.me/support/drive-cli). This will be kept up-to-date with latest API until the official desktop app is here. 
+If you have already signed in with the Proton Drive CLI, keep that login.
+Otherwise, use the [official CLI](https://proton.me/support/drive-cli) to sign in:
 
 ```sh
 proton-drive auth login
 ```
 
-`proton-drive` must be on `PATH`, or `proton_drive_bin` must point to its
-executable. Then install the sync wrapper:
+Then install the sync service:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/screwys/pdrive-sync-rs/main/install.sh | sh
 ```
 
-The installer puts `pdrive-sync` in `~/.local/bin`, opens the interactive
+The installer puts `pdrive-sync` and `pdrive-sync-sdk` in `~/.local/bin`, opens the interactive
 configuration, and installs and starts `pdrive-sync.service`. It detects a
-systemd, dinit, or OpenRC user service manager automatically.
+systemd, dinit, or OpenRC user service manager automatically. Installation uses
+the release binaries and does not require Rust, Cargo, or Bun.
 
 For a restore that supplies its own saved configuration and services, run
 `sh install.sh --no-setup`. This installs the executable without interactive
@@ -60,8 +63,6 @@ The systemd unit also applies a soft `MemoryHigh=512M` cache-reclaim boundary.
 The default file is `~/.config/pdrive-sync/config.toml`:
 
 ```toml
-proton_drive_bin = "proton-drive"
-
 [[sync]]
 name = "documents"
 mode = "push"
@@ -88,25 +89,53 @@ Run selected entries with `pdrive-sync sync documents photos`, or describe a
 safe one-off sync with `--local`, `--remote`, `--mode`, and `--delete`.
 `pdrive-sync config validate` checks the file.
 
+The SDK helper defaults to the executable next to `pdrive-sync`. Set `sdk_bin`
+in the configuration, or `sync --sdk-bin PATH` for a one-off run, to override it.
+SDK caches are separate from the CLI's caches, under
+`$XDG_CACHE_HOME/pdrive-sync-sdk` or `~/.cache/pdrive-sync-sdk`.
+`PDRIVE_SYNC_SDK_CACHE_DIR` overrides that location. The SDK client identity lives
+under `$XDG_DATA_HOME/pdrive-sync-sdk` or `~/.local/share/pdrive-sync-sdk`, so clearing
+caches does not change upload draft ownership. Credentials still use the CLI's
+configured keyring, pass store, or portable credentials directory.
+
+## Build
+
+Install Rust and Bun 1.4.2, then run:
+
+```sh
+sdk/build.sh
+cargo build --locked
+```
+
+The SDK build downloads the pinned Proton sources and dependencies into `target`.
+It produces `target/debug/pdrive-sync-sdk` beside the Rust executable.
+For release builds, use `SDK_OUTPUT_DIR=target/release sdk/build.sh` and
+`cargo build --locked --release`.
+
 ## Behavior
 
-Push scans only file metadata locally. New or changed files are sent to the
-Proton Drive CLI in bounded batches; the CLI performs its required hashing and
-automatically skips files whose remote content already matches. Each successful
-batch item is checkpointed immediately, including when another item in the same
-batch fails. Remote cleanup is also batched and begins only after every upload
-batch succeeds.
+Remote discovery uses node IDs. The first run inventories the included remote
+folders; later runs read SDK events from a saved cursor and update that inventory.
+The inventory and cursor commit together. A server refresh request or changed
+exclusions causes a new inventory. Excluded folders are skipped during traversal.
 
-Runs using the same state database wait for each other. Push cleanup checks
-the local file list again after uploads, so files added during a long upload
-are kept on Proton Drive.
+Push checks local metadata and the last accepted remote checksum. Changed files
+upload in bounded batches. The SDK hashes and encrypts their content and skips
+files that already match. Its upload receipts supply the accepted checksum and
+revision without another Rust hashing pass. Successful items are checkpointed
+even when other items in the same batch fail. Cleanup starts after all uploads
+succeed, and push checks the local file list again before cleanup after uploads.
 
-Pull and two-way sync still verify downloaded content against Proton Drive's
-SHA-1 metadata. A push checkpoint does not store a duplicate locally computed
-SHA-1; if the same entry later changes to two-way mode, its digest is rebuilt
-once before conflict planning.
+Two-way sync hashes changed local files and compares both sides with the last
+successful checkpoint. The helper checks remote revisions before writes, and
+the service checks for local edits before downloads replace a file or local
+files move to Trash. Downloads verify their size and SHA-1 while the SDK writes
+the staged content, then move into place.
 
-Symlinks and non-UTF-8 names are skipped or rejected. Empty directories are not reproduced. Pull and two-way modes inventory the remote tree on each run because the CLI does not expose the SDK event stream.
+Runs using the same state database wait for each other. State records the local
+and remote roots so changing a configured destination starts a new baseline.
+
+Symlinks and non-UTF-8 names are skipped or rejected. Empty directories are not reproduced.
 
 ## License
 

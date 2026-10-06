@@ -4,18 +4,16 @@ mod drive;
 mod state;
 
 pub use drive::{
-    CliDrive, DriveClient, RemoteDigests, RemoteFile, RemoteNode, RemoteRevision, ResultValue,
-    TrashBatchResult, TrashTarget, UploadBatchResult, UploadFailure, optimize_cli_cache,
-    optimize_cli_cache_dir,
+    DriveClient, LocalUpload, RemoteDigests, RemoteEvent, RemoteEvents, RemoteFile, RemoteNode,
+    RemoteParent, RemoteRevision, RemoteVersion, ResultValue, SdkDrive, TrashBatchResult,
+    TrashTarget, UploadBatchResult, UploadFailure,
 };
-#[cfg(test)]
-use drive::{quote_repl_argument, reject_repl_newlines};
 #[cfg(test)]
 use state::CHECKPOINT_BATCH_SIZE;
 use state::{
-    CheckpointBatch, FileState, all_file_states, delete_file_state, file_state, metadata_value,
-    remote_directory_known, replace_remote_directories, save_remote_directory, set_metadata,
-    stale_paths,
+    CheckpointBatch, FileState, RemoteSnapshot, all_file_states, bind_sync, delete_file_state,
+    delete_file_states_and_remote_nodes, file_state, metadata_value, remote_snapshot,
+    replace_remote_snapshot, set_metadata, stale_paths,
 };
 pub use state::{default_state_dir, open_database, write_success_file};
 
@@ -35,10 +33,8 @@ const TRASH_BATCH_SIZE: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default = "default_proton_drive_bin")]
-    pub proton_drive_bin: PathBuf,
-    #[serde(default = "default_optimize_cli_cache")]
-    pub optimize_cli_cache: bool,
+    #[serde(default = "default_sdk_bin")]
+    pub sdk_bin: PathBuf,
     #[serde(default = "default_notifications")]
     pub notifications: bool,
     pub state_db: Option<PathBuf>,
@@ -90,12 +86,11 @@ pub struct SyncConfig {
     pub exclude: Vec<String>,
 }
 
-fn default_proton_drive_bin() -> PathBuf {
-    PathBuf::from("proton-drive")
-}
-
-fn default_optimize_cli_cache() -> bool {
-    true
+pub fn default_sdk_bin() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("pdrive-sync-sdk")))
+        .unwrap_or_else(|| PathBuf::from("pdrive-sync-sdk"))
 }
 
 fn default_notifications() -> bool {
@@ -126,12 +121,14 @@ struct LocalFile {
 struct PendingUpload {
     file: LocalFile,
     checkpoint_sha1: Option<String>,
+    expected_remote: Option<RemoteVersion>,
 }
 
 #[derive(Default)]
 struct RemoteTree {
     files: HashMap<String, RemoteFile>,
     directories: HashSet<String>,
+    directory_uids: HashMap<String, String>,
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
@@ -192,21 +189,11 @@ pub fn sync_push(
     require_ready(mirror)?;
 
     let excludes = build_excludes(mirror)?;
+    let mut remote_tree = inventory_remote(mirror, connection, drive, None)?;
     let (files, skipped_symlinks) = scan_local_files(mirror, &excludes)?;
     let states = all_file_states(connection, &mirror.name)?;
     let baseline_key = format!("baseline:{}", mirror.name);
     let baseline_complete = metadata_value(connection, &baseline_key)?.as_deref() == Some("1");
-    let mut remote_tree = if !baseline_complete && mirror.delete == DeletePolicy::Trash {
-        Some(inventory_remote(
-            mirror,
-            connection,
-            drive,
-            Some("baseline"),
-        )?)
-    } else {
-        None
-    };
-
     let mut summary = SyncSummary {
         scanned: files.len(),
         skipped_symlinks,
@@ -215,48 +202,89 @@ pub fn sync_push(
     let mut seen = HashSet::with_capacity(files.len());
     let mut uploads = Vec::new();
 
+    let mut rebuilt_digests = 0;
+    let mut migration = CheckpointBatch::new(connection);
     for local in files {
         seen.insert(local.relative.clone());
-        if states.get(&local.relative).is_some_and(|previous| {
-            previous.size == local.size && previous.mtime_ns == local.mtime_ns
-        }) {
+        let previous = states
+            .get(&local.relative)
+            .filter(|previous| previous.size == local.size && previous.mtime_ns == local.mtime_ns);
+        let rebuilt = if previous.is_some_and(|previous| previous.sha1.is_empty()) {
+            let digest = sha1_file(&local.absolute)?;
+            ensure_local_version(mirror, &local.relative, Some(&local))?;
+            rebuilt_digests += 1;
+            if rebuilt_digests % 1000 == 0 {
+                eprintln!(
+                    "[pdrive-sync] {}: rebuilt {rebuilt_digests} checkpoint digests",
+                    mirror.name
+                );
+            }
+            Some(digest)
+        } else {
+            None
+        };
+        let digest = rebuilt
+            .as_deref()
+            .or_else(|| previous.map(|previous| previous.sha1.as_str()));
+        if previous.is_some()
+            && remote_tree
+                .files
+                .get(&local.relative)
+                .is_some_and(|remote| {
+                    remote.claimed_size == local.size
+                        && digest.is_some_and(|digest| remote.sha1.eq_ignore_ascii_case(digest))
+                })
+        {
+            if let Some(digest) = &rebuilt {
+                migration.push(
+                    &mirror.name,
+                    &local.relative,
+                    local.size,
+                    local.mtime_ns,
+                    digest,
+                )?;
+            }
             summary.unchanged += 1;
             continue;
         }
         uploads.push(PendingUpload {
             file: local,
-            checkpoint_sha1: None,
+            checkpoint_sha1: rebuilt,
+            expected_remote: None,
         });
     }
+    migration.flush()?;
     if !uploads.is_empty() {
         eprintln!(
-            "[pdrive-sync] {}: {} files need remote reconciliation",
+            "[pdrive-sync] {}: {} files need checking",
             mirror.name,
             uploads.len()
         );
     }
-    execute_uploads(mirror, connection, drive, uploads, &mut summary)?;
+    let had_uploads = !uploads.is_empty();
+    execute_uploads(
+        mirror,
+        connection,
+        drive,
+        uploads,
+        &mut remote_tree.directory_uids,
+        &mut summary,
+    )?;
 
     // Uploads can take long enough for local files to be added or removed.
-    require_ready(mirror)?;
-    let (current_files, _) = scan_local_files(mirror, &excludes)?;
-    seen = current_files
-        .into_iter()
-        .map(|file| file.relative)
-        .collect();
+    if had_uploads {
+        require_ready(mirror)?;
+        let (current_files, _) = scan_local_files(mirror, &excludes)?;
+        seen = current_files
+            .into_iter()
+            .map(|file| file.relative)
+            .collect();
+    }
     let stale = stale_paths(connection, &mirror.name, &seen)?;
     if mirror.delete == DeletePolicy::Trash {
-        if remote_tree.is_none() && !stale.is_empty() {
-            remote_tree = Some(inventory_remote(
-                mirror,
-                connection,
-                drive,
-                Some("cleanup"),
-            )?);
-        }
-
         let mut trash_paths = BTreeSet::new();
-        if let Some(tree) = remote_tree.as_ref() {
+        {
+            let tree = &remote_tree;
             for path in &stale {
                 if excludes.is_match(path) {
                     continue;
@@ -280,13 +308,20 @@ pub fn sync_push(
             .into_iter()
             .filter_map(|path| {
                 remote_tree
-                    .as_ref()
-                    .and_then(|tree| tree.files.get(&path))
+                    .files
+                    .get(&path)
                     .cloned()
                     .map(|remote| (path, remote))
             })
             .collect();
-        execute_remote_trash(mirror, connection, drive, trash_items, &mut summary)?;
+        execute_remote_trash(
+            mirror,
+            connection,
+            drive,
+            trash_items,
+            &remote_tree.directory_uids,
+            &mut summary,
+        )?;
     } else {
         for path in stale {
             if !excludes.is_match(&path) {
@@ -295,7 +330,6 @@ pub fn sync_push(
         }
     }
     set_metadata(connection, &baseline_key, "1")?;
-    drop(remote_tree.take());
     Ok(summary)
 }
 
@@ -306,12 +340,12 @@ pub fn sync_pull(
 ) -> Result<SyncSummary> {
     require_ready(sync)?;
     let excludes = build_excludes(sync)?;
+    let tree = inventory_remote(sync, connection, drive, None)?;
     let (local_files, skipped_symlinks) = scan_local_files(sync, &excludes)?;
     let local_files = local_files
         .into_iter()
         .map(|file| (file.relative.clone(), file))
         .collect::<HashMap<_, _>>();
-    let tree = inventory_remote(sync, connection, drive, None)?;
 
     let mut summary = SyncSummary {
         scanned: local_files.len(),
@@ -349,7 +383,7 @@ pub fn sync_pull(
             }
         }
 
-        let local = download_remote_file(sync, drive, path, remote)?;
+        let local = download_remote_file(sync, drive, path, remote, None, false)?;
         checkpoints.push(&sync.name, path, local.size, local.mtime_ns, &remote.sha1)?;
         summary.downloaded += 1;
     }
@@ -393,6 +427,9 @@ pub fn sync_two_way(
     drive: &mut dyn DriveClient,
 ) -> Result<SyncSummary> {
     require_ready(sync)?;
+    let initial = inventory_remote(sync, connection, drive, None)?;
+    let initial_root_uid = initial.directory_uids[""].clone();
+    drop(initial);
     let states = all_file_states(connection, &sync.name)?;
     let excludes = build_excludes(sync)?;
     let (local_files, skipped_symlinks) = scan_local_files(sync, &excludes)?;
@@ -409,6 +446,9 @@ pub fn sync_two_way(
     }
 
     let mut remote = inventory_remote(sync, connection, drive, None)?;
+    if remote.directory_uids[""] != initial_root_uid {
+        bail!("remote sync root changed during local scan; retry the sync");
+    }
     remote.files.retain(|path, _| !excludes.is_match(path));
     let actions = plan_two_way(sync, &local, &remote.files, &states)?;
 
@@ -437,11 +477,25 @@ pub fn sync_two_way(
             TwoWayAction::Upload { path, sha1 } => Some(PendingUpload {
                 file: local[path].file.clone(),
                 checkpoint_sha1: Some(sha1.clone()),
+                expected_remote: Some(remote.files.get(path).map_or(
+                    RemoteVersion::Absent,
+                    |file| RemoteVersion::Revision {
+                        uid: file.uid.clone(),
+                        revision_uid: file.revision_uid.clone(),
+                    },
+                )),
             }),
             _ => None,
         })
         .collect();
-    execute_uploads(sync, connection, drive, uploads, &mut summary)?;
+    execute_uploads(
+        sync,
+        connection,
+        drive,
+        uploads,
+        &mut remote.directory_uids,
+        &mut summary,
+    )?;
 
     let mut download_checkpoints = CheckpointBatch::new(connection);
     for action in &actions {
@@ -449,7 +503,14 @@ pub fn sync_two_way(
             continue;
         };
         let remote_file = &remote.files[path];
-        let file = download_remote_file(sync, drive, path, remote_file)?;
+        let file = download_remote_file(
+            sync,
+            drive,
+            path,
+            remote_file,
+            local.get(path).map(|snapshot| &snapshot.file),
+            true,
+        )?;
         download_checkpoints.push(
             &sync.name,
             path,
@@ -468,10 +529,18 @@ pub fn sync_two_way(
             _ => None,
         })
         .collect();
-    execute_remote_trash(sync, connection, drive, remote_trash, &mut summary)?;
+    execute_remote_trash(
+        sync,
+        connection,
+        drive,
+        remote_trash,
+        &remote.directory_uids,
+        &mut summary,
+    )?;
 
     for action in &actions {
         if let TwoWayAction::TrashLocal { path } = action {
+            ensure_local_version(sync, path, Some(&local[path].file))?;
             trash::delete(&local[path].file.absolute)
                 .with_context(|| format!("failed to trash local path {path}"))?;
             delete_file_state(connection, &sync.name, path)?;
@@ -607,6 +676,8 @@ fn download_remote_file(
     drive: &mut dyn DriveClient,
     relative: &str,
     remote: &RemoteFile,
+    expected_local: Option<&LocalFile>,
+    protect_local: bool,
 ) -> Result<LocalFile> {
     let target = sync.local.join(relative);
     let parent = target
@@ -616,7 +687,10 @@ fn download_remote_file(
     let staging = tempfile::Builder::new()
         .prefix(".pdrive-sync-download-")
         .tempdir_in(parent)?;
-    drive.download(&remote_path(&sync.remote, relative), staging.path())?;
+    if protect_local {
+        ensure_local_version(sync, relative, expected_local)?;
+    }
+    drive.download(remote, staging.path())?;
     let name = target
         .file_name()
         .context("local download target has no name")?;
@@ -630,13 +704,36 @@ fn download_remote_file(
             metadata.len()
         );
     }
-    let digest = sha1_file(&staged)?;
-    if !digest.eq_ignore_ascii_case(&remote.sha1) {
-        bail!("downloaded SHA-1 mismatch for {relative}");
+    if protect_local {
+        ensure_local_version(sync, relative, expected_local)?;
     }
     fs::rename(&staged, &target)
         .with_context(|| format!("failed to install downloaded file {relative}"))?;
     local_file(&sync.local, target)
+}
+
+fn ensure_local_version(
+    sync: &SyncConfig,
+    relative: &str,
+    expected: Option<&LocalFile>,
+) -> Result<()> {
+    let path = sync.local.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let current = local_file(&sync.local, path)?;
+            if expected
+                .is_some_and(|file| current.size == file.size && current.mtime_ns == file.mtime_ns)
+            {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {
+            return Ok(());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    bail!("local file changed during sync: {relative}; retry the sync")
 }
 
 fn execute_uploads(
@@ -644,6 +741,7 @@ fn execute_uploads(
     connection: &Connection,
     drive: &mut dyn DriveClient,
     uploads: Vec<PendingUpload>,
+    directories: &mut HashMap<String, String>,
     summary: &mut SyncSummary,
 ) -> Result<()> {
     if uploads.is_empty() {
@@ -652,7 +750,12 @@ fn execute_uploads(
 
     let total = uploads.len();
     let mut by_parent = BTreeMap::<String, Vec<PendingUpload>>::new();
-    for upload in uploads {
+    for mut upload in uploads {
+        if upload.checkpoint_sha1.is_some() {
+            ensure_local_version(sync, &upload.file.relative, Some(&upload.file))?;
+        } else {
+            upload.file = local_file(&sync.local, upload.file.absolute.clone())?;
+        }
         by_parent
             .entry(relative_parent(&upload.file.relative).to_owned())
             .or_default()
@@ -662,7 +765,8 @@ fn execute_uploads(
     let mut completed = 0;
     let mut failures = Vec::new();
     for (parent, parent_uploads) in by_parent {
-        ensure_remote_directory(sync, connection, drive, &parent)?;
+        let parent_uid = ensure_remote_directory(sync, connection, drive, &parent, directories)?;
+        let target = remote_parent(sync, &parent, parent_uid);
         for batch in parent_uploads.chunks(UPLOAD_BATCH_SIZE) {
             let batch_bytes = batch.iter().map(|upload| upload.file.size).sum::<u64>();
             eprintln!(
@@ -673,13 +777,15 @@ fn execute_uploads(
             );
             let local_paths = batch
                 .iter()
-                .map(|upload| upload.file.absolute.clone())
+                .map(|upload| LocalUpload {
+                    path: upload.file.absolute.clone(),
+                    sha1: upload.checkpoint_sha1.clone(),
+                    expected_remote: upload.expected_remote.clone(),
+                })
                 .collect::<Vec<_>>();
-            let result = drive
-                .upload_many(&local_paths, &remote_path(&sync.remote, &parent))
-                .with_context(|| {
-                    format!("failed to upload batch for remote directory {parent:?}")
-                })?;
+            let result = drive.upload_many(&local_paths, &target).with_context(|| {
+                format!("failed to upload batch for remote directory {parent:?}")
+            })?;
             let failed_names = result
                 .failures
                 .iter()
@@ -701,16 +807,23 @@ fn execute_uploads(
                     &upload.file.relative,
                     upload.file.size,
                     upload.file.mtime_ns,
-                    upload.checkpoint_sha1.as_deref().unwrap_or_default(),
+                    result
+                        .nodes
+                        .iter()
+                        .find(|node| node.name.value.as_deref() == Some(name))
+                        .and_then(|node| node.active_revision.as_ref())
+                        .and_then(|revision| revision.claimed_digests.as_ref())
+                        .and_then(|digests| digests.sha1.as_deref())
+                        .context("successful SDK upload has no checksum receipt")?,
                 )?;
             }
-            checkpoints.flush()?;
+            checkpoints.flush_with_remote_nodes(&sync.name, &result.nodes)?;
 
             summary.uploaded += result.transferred_items;
             summary.matched_remote += result.skipped_items;
             completed += batch.len();
             eprintln!(
-                "[pdrive-sync] {}: reconciled {completed}/{total} files (uploaded={} already_present={} failed={} bytes={})",
+                "[pdrive-sync] {}: processed {completed}/{total} files (uploaded={} already_present={} failed={} bytes={})",
                 sync.name,
                 result.transferred_items,
                 result.skipped_items,
@@ -739,6 +852,7 @@ fn execute_remote_trash(
     connection: &Connection,
     drive: &mut dyn DriveClient,
     items: Vec<(String, RemoteFile)>,
+    directories: &HashMap<String, String>,
     summary: &mut SyncSummary,
 ) -> Result<()> {
     if items.is_empty() {
@@ -757,18 +871,34 @@ fn execute_remote_trash(
         let targets = batch
             .iter()
             .map(|(path, remote)| TrashTarget {
-                remote_path: remote_path(&sync.remote, path),
+                parent: remote_parent(
+                    sync,
+                    relative_parent(path),
+                    directories[relative_parent(path)].clone(),
+                ),
+                name: path.rsplit('/').next().unwrap_or(path).to_owned(),
                 uid: remote.uid.clone(),
+                revision_uid: (sync.mode == SyncMode::TwoWay).then(|| remote.revision_uid.clone()),
             })
             .collect::<Vec<_>>();
         let result = drive.trash_many(&targets)?;
-        let succeeded = result.succeeded_uids.into_iter().collect::<HashSet<_>>();
-        for (path, remote) in batch {
-            if succeeded.contains(&remote.uid) {
-                delete_file_state(connection, &sync.name, path)?;
-                summary.trashed += 1;
-            }
-        }
+        let succeeded = result
+            .succeeded_uids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let paths = batch
+            .iter()
+            .filter(|(_, remote)| succeeded.contains(&remote.uid))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        delete_file_states_and_remote_nodes(
+            connection,
+            &sync.name,
+            &paths,
+            &result.succeeded_uids,
+        )?;
+        summary.trashed += paths.len();
         failures += result.failed_uids.len();
         completed += batch.len();
         eprintln!(
@@ -834,12 +964,10 @@ fn scan_directory(
     files: &mut Vec<LocalFile>,
     skipped_symlinks: &mut usize,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(directory)
-        .with_context(|| format!("failed to read {}", directory.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
+    let entries = fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?;
     for entry in entries {
+        let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         let relative_path = path.strip_prefix(root)?;
@@ -938,118 +1066,395 @@ fn inventory_remote(
     drive: &mut dyn DriveClient,
     reason: Option<&str>,
 ) -> Result<RemoteTree> {
-    let mut tree = RemoteTree::default();
-    tree.directories.insert(String::new());
-    let mut visited = HashSet::new();
-    load_remote_tree(drive, &sync.remote, "", &mut visited, &mut tree)?;
+    let excludes = build_excludes(sync)?;
+    bind_sync(connection, sync, None)?;
+    let mut cached = remote_snapshot(connection, &sync.name)?;
+    if cached.is_none() {
+        drive.reset_cache()?;
+    }
+    // Process saved events before resolving names through the SDK's node cache.
+    let changes = cached
+        .as_ref()
+        .map(|snapshot| drive.events(&snapshot.scope_id, Some(&snapshot.cursor)))
+        .transpose()?;
+    if changes.as_ref().is_some_and(|changes| changes.removed) {
+        drive.reset_cache()?;
+    }
+    let root = drive
+        .info(&sync.remote)?
+        .context("remote sync root does not exist")?;
+    if root.kind != "folder" {
+        bail!("remote sync root is not a folder");
+    }
+    let scope = root
+        .tree_event_scope_id
+        .clone()
+        .context("remote root has no event scope")?;
+    if bind_sync(connection, sync, Some(&root.uid))? {
+        cached = None;
+    }
+    let filters_key = format!("remote-excludes:{}", sync.name);
+    let filters = serde_json::to_string(&sync.exclude)?;
+    if metadata_value(connection, &filters_key)?.as_deref() != Some(&filters) {
+        cached = None;
+    }
+    if changes.as_ref().is_some_and(|events| {
+        events.events.iter().any(|event| {
+            event.node_uid.as_deref() == Some(&root.uid)
+                && (event.kind == "node_deleted" || event.is_trashed == Some(true))
+        })
+    }) {
+        cached = None;
+    }
+    let verify_root = cached.is_none()
+        || changes.as_ref().is_some_and(|changes| {
+            changes.refresh
+                || changes.removed
+                || changes
+                    .events
+                    .iter()
+                    .any(|event| event.node_uid.as_deref() == Some(&root.uid))
+        });
+    let mut snapshot_changed = true;
+    let mut snapshot = match (cached, changes) {
+        (Some(mut snapshot), Some(changes))
+            if snapshot.root_uid == root.uid
+                && snapshot.scope_id == scope
+                && !changes.refresh
+                && !changes.removed =>
+        {
+            snapshot_changed = snapshot.cursor != changes.cursor
+                || !changes.events.is_empty()
+                || snapshot.nodes.get(&root.uid) != Some(&root);
+            snapshot.nodes.insert(root.uid.clone(), root.clone());
+            apply_remote_events(drive, &excludes, &mut snapshot, changes)?;
+            snapshot
+        }
+        _ => {
+            let start = drive.events(&scope, None)?;
+            if start.removed {
+                bail!("remote sync tree is no longer accessible");
+            }
+            let mut snapshot = RemoteSnapshot {
+                root_uid: root.uid.clone(),
+                scope_id: scope,
+                cursor: start.cursor,
+                nodes: HashMap::new(),
+            };
+            load_remote_nodes(drive, &root, "", &excludes, &mut snapshot.nodes)?;
+            let changes = drive.events(&snapshot.scope_id, Some(&snapshot.cursor))?;
+            if changes.refresh || changes.removed {
+                bail!("remote tree needs a new inventory; retry the sync");
+            }
+            apply_remote_events(drive, &excludes, &mut snapshot, changes)?;
+            snapshot
+        }
+    };
+    let root = if verify_root {
+        let current = drive
+            .info(&sync.remote)?
+            .context("remote sync root was removed during inventory")?;
+        if current.uid != root.uid {
+            bail!("remote sync root changed during inventory; retry the sync");
+        }
+        current
+    } else {
+        root
+    };
+    snapshot_changed |= snapshot.nodes.get(&root.uid) != Some(&root);
+    snapshot.nodes.insert(root.uid.clone(), root);
+    let tree = remote_tree(&snapshot, &excludes)?;
+    if snapshot_changed {
+        replace_remote_snapshot(connection, &sync.name, &snapshot)?;
+    }
+    set_metadata(connection, &filters_key, &filters)?;
     if let Some(reason) = reason {
         eprintln!(
-            "[pdrive-sync] {}: remote {reason} listed {} files in {} directories",
+            "[pdrive-sync] {}: remote {reason} has {} files in {} directories",
             sync.name,
             tree.files.len(),
             tree.directories.len()
         );
     }
-    replace_remote_directories(connection, &sync.name, &tree.directories)?;
-    drive.release_session()?;
     Ok(tree)
 }
 
-fn load_remote_tree(
+fn remote_name(node: &RemoteNode) -> Result<&str> {
+    if !node.name.ok {
+        bail!("remote node name could not be decrypted; inventory is incomplete");
+    }
+    let name = node
+        .name
+        .value
+        .as_deref()
+        .context("remote node has no name; inventory is incomplete")?;
+    if name.contains('/') {
+        bail!("remote name contains a path separator");
+    }
+    Ok(name)
+}
+
+fn load_remote_nodes(
     drive: &mut dyn DriveClient,
-    remote_root: &str,
-    relative_root: &str,
-    visited: &mut HashSet<String>,
-    tree: &mut RemoteTree,
+    root: &RemoteNode,
+    relative: &str,
+    excludes: &GlobSet,
+    nodes: &mut HashMap<String, RemoteNode>,
 ) -> Result<()> {
-    for node in drive.list(&remote_path(remote_root, relative_root))? {
-        if !visited.insert(node.uid.clone()) {
+    nodes.insert(root.uid.clone(), root.clone());
+    for mut node in drive.list(&root.uid)? {
+        let path = join_relative(relative, remote_name(&node)?);
+        if excludes.is_match(&path)
+            || (node.kind == "folder" && excludes.is_match(format!("{path}/")))
+        {
             continue;
         }
-        if !node.name.ok {
-            continue;
-        }
-        let Some(name) = node.name.value.as_deref() else {
-            continue;
-        };
-        if name.contains('/') {
-            continue;
-        }
-        let relative = join_relative(relative_root, name);
-        match node.kind.as_str() {
-            "file" => {
-                if let Some(file) = remote_file(Some(node)) {
-                    tree.files.insert(relative, file);
-                }
+        node.parent_uid = Some(root.uid.clone());
+        if node.kind == "folder" {
+            load_remote_nodes(drive, &node, &path, excludes, nodes)?;
+            if nodes.len().is_multiple_of(250) {
+                eprintln!(
+                    "[pdrive-sync] remote inventory: {} nodes listed",
+                    nodes.len()
+                );
             }
-            "folder" => {
-                tree.directories.insert(relative.clone());
-                if tree.directories.len().is_multiple_of(250) {
-                    eprintln!(
-                        "[pdrive-sync] remote baseline: {} directories listed",
-                        tree.directories.len()
-                    );
-                }
-                load_remote_tree(drive, remote_root, &relative, visited, tree)?;
-            }
-            _ => {}
+        } else {
+            nodes.insert(node.uid.clone(), node);
         }
     }
     Ok(())
 }
 
-fn remote_file(node: Option<RemoteNode>) -> Option<RemoteFile> {
-    let node = node?;
-    if node.kind != "file" {
-        return None;
+fn remove_remote_subtree(nodes: &mut HashMap<String, RemoteNode>, uid: &str) {
+    if nodes.get(uid).is_none_or(|node| node.kind != "folder") {
+        nodes.remove(uid);
+        return;
     }
-    let uid = node.uid;
-    let revision = node.active_revision?;
-    Some(RemoteFile {
-        uid,
-        sha1: revision.claimed_digests.sha1,
-        claimed_size: revision.claimed_size,
-    })
+    let mut children = HashMap::<String, Vec<String>>::new();
+    for node in nodes.values() {
+        if let Some(parent) = &node.parent_uid {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(node.uid.clone());
+        }
+    }
+    let mut remove = vec![uid.to_owned()];
+    while let Some(uid) = remove.pop() {
+        if let Some(descendants) = children.remove(&uid) {
+            remove.extend(descendants);
+        }
+        nodes.remove(&uid);
+    }
+}
+
+fn remote_relative(uid: &str, snapshot: &RemoteSnapshot) -> Result<Option<String>> {
+    let mut uid = uid;
+    let mut parts = Vec::new();
+    while uid != snapshot.root_uid {
+        let Some(node) = snapshot.nodes.get(uid) else {
+            return Ok(None);
+        };
+        parts.push(node);
+        let Some(parent) = node.parent_uid.as_deref() else {
+            return Ok(None);
+        };
+        uid = parent;
+    }
+    parts.reverse();
+    Ok(Some(
+        parts
+            .into_iter()
+            .map(remote_name)
+            .collect::<Result<Vec<_>>>()?
+            .join("/"),
+    ))
+}
+
+fn apply_remote_events(
+    drive: &mut dyn DriveClient,
+    excludes: &GlobSet,
+    snapshot: &mut RemoteSnapshot,
+    changes: RemoteEvents,
+) -> Result<()> {
+    let has_node_changes = changes.events.iter().any(|event| event.node_uid.is_some());
+    for event in changes.events {
+        let Some(uid) = event.node_uid else {
+            continue;
+        };
+        if event.kind == "node_deleted" || event.is_trashed == Some(true) {
+            if uid == snapshot.root_uid {
+                bail!("remote sync root was removed during inventory");
+            }
+            remove_remote_subtree(&mut snapshot.nodes, &uid);
+            continue;
+        }
+        let Some(node) = drive.info(&uid)? else {
+            remove_remote_subtree(&mut snapshot.nodes, &uid);
+            continue;
+        };
+        let mut chain = vec![node.clone()];
+        let mut parent = node.parent_uid.clone();
+        while let Some(uid) = parent {
+            if snapshot.nodes.contains_key(&uid) {
+                break;
+            }
+            let Some(ancestor) = drive.info(&uid)? else {
+                break;
+            };
+            parent = ancestor.parent_uid.clone();
+            chain.push(ancestor);
+        }
+        let new_folders = chain
+            .iter()
+            .filter(|node| node.kind == "folder" && !snapshot.nodes.contains_key(&node.uid))
+            .map(|node| node.uid.clone())
+            .collect::<Vec<_>>();
+        let chain_uids = chain
+            .iter()
+            .map(|node| node.uid.clone())
+            .collect::<Vec<_>>();
+        for node in chain {
+            snapshot.nodes.insert(node.uid.clone(), node);
+        }
+        if remote_relative(&node.uid, snapshot)?.is_some() {
+            // A child event can introduce several ancestors. Remove excluded ones before listing.
+            for uid in chain_uids.into_iter().rev() {
+                if let Some(relative) = remote_relative(&uid, snapshot)? {
+                    let entry = &snapshot.nodes[&uid];
+                    if excludes.is_match(&relative)
+                        || (entry.kind == "folder" && excludes.is_match(format!("{relative}/")))
+                    {
+                        remove_remote_subtree(&mut snapshot.nodes, &uid);
+                    }
+                }
+            }
+            for uid in new_folders.into_iter().rev() {
+                if let Some(relative) = remote_relative(&uid, snapshot)? {
+                    let folder = snapshot.nodes[&uid].clone();
+                    load_remote_nodes(drive, &folder, &relative, excludes, &mut snapshot.nodes)?;
+                    break;
+                }
+            }
+        } else {
+            remove_remote_subtree(&mut snapshot.nodes, &node.uid);
+        }
+    }
+    snapshot.cursor = changes.cursor;
+    if has_node_changes {
+        let mut children = HashMap::<&str, Vec<&str>>::new();
+        for node in snapshot.nodes.values() {
+            if let Some(parent) = node.parent_uid.as_deref() {
+                children.entry(parent).or_default().push(&node.uid);
+            }
+        }
+        let mut keep = HashSet::new();
+        let mut pending = vec![snapshot.root_uid.as_str()];
+        while let Some(uid) = pending.pop() {
+            keep.insert(uid.to_owned());
+            if let Some(nodes) = children.get(uid) {
+                pending.extend(nodes);
+            }
+        }
+        snapshot.nodes.retain(|uid, _| keep.contains(uid));
+    }
+    Ok(())
+}
+
+fn remote_tree(snapshot: &RemoteSnapshot, excludes: &GlobSet) -> Result<RemoteTree> {
+    let mut tree = RemoteTree::default();
+    tree.directories.insert(String::new());
+    tree.directory_uids
+        .insert(String::new(), snapshot.root_uid.clone());
+    let mut children = HashMap::<&str, Vec<&RemoteNode>>::new();
+    for node in snapshot.nodes.values() {
+        if let Some(parent) = node.parent_uid.as_deref() {
+            children.entry(parent).or_default().push(node);
+        }
+    }
+    let mut folders = vec![(snapshot.root_uid.as_str(), String::new())];
+    while let Some((uid, parent)) = folders.pop() {
+        for node in children.get(uid).into_iter().flatten() {
+            let relative = join_relative(&parent, remote_name(node)?);
+            if excludes.is_match(&relative)
+                || (node.kind == "folder" && excludes.is_match(format!("{relative}/")))
+            {
+                continue;
+            }
+            match node.kind.as_str() {
+                "folder" => {
+                    tree.directories.insert(relative.clone());
+                    tree.directory_uids
+                        .insert(relative.clone(), node.uid.clone());
+                    folders.push((&node.uid, relative));
+                }
+                "file" => {
+                    let revision = node
+                        .active_revision
+                        .as_ref()
+                        .context("remote file metadata is incomplete")?;
+                    let sha1 = revision
+                        .claimed_digests
+                        .as_ref()
+                        .and_then(|digests| digests.sha1.as_deref())
+                        .filter(|digest| !digest.is_empty())
+                        .with_context(|| {
+                            format!("remote checksum is unavailable for {relative}")
+                        })?;
+                    let size = revision
+                        .claimed_size
+                        .with_context(|| format!("remote size is unavailable for {relative}"))?;
+                    tree.files.insert(
+                        relative,
+                        RemoteFile {
+                            uid: node.uid.clone(),
+                            revision_uid: revision.uid.clone(),
+                            sha1: sha1.to_owned(),
+                            claimed_size: size,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(tree)
 }
 
 fn ensure_remote_directory(
-    mirror: &SyncConfig,
+    sync: &SyncConfig,
     connection: &Connection,
     drive: &mut dyn DriveClient,
     relative: &str,
-) -> Result<()> {
-    if relative.is_empty() || remote_directory_known(connection, &mirror.name, relative)? {
-        return Ok(());
+    directories: &mut HashMap<String, String>,
+) -> Result<String> {
+    if let Some(uid) = directories.get(relative) {
+        return Ok(uid.clone());
     }
-
     let parent = relative_parent(relative);
-    ensure_remote_directory(mirror, connection, drive, parent)?;
-    let remote = remote_path(&mirror.remote, relative);
-    match drive.info(&remote)? {
-        Some(node) if node.kind == "folder" => {}
-        Some(_) => bail!("remote path exists but is not a folder: {remote}"),
-        None => {
-            let name = relative.rsplit('/').next().unwrap_or(relative);
-            drive.create_folder(&remote_path(&mirror.remote, parent), name)?;
-        }
-    }
-    save_remote_directory(connection, &mirror.name, relative)
+    let parent_uid = ensure_remote_directory(sync, connection, drive, parent, directories)?;
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    let node = match drive.child(&parent_uid, name)? {
+        Some(node) if node.kind == "folder" => node,
+        Some(_) => bail!("remote path exists but is not a folder: {relative}"),
+        None => drive.create_folder(&remote_parent(sync, parent, parent_uid), name)?,
+    };
+    let mut receipts = CheckpointBatch::new(connection);
+    receipts.flush_with_remote_nodes(&sync.name, std::slice::from_ref(&node))?;
+    directories.insert(relative.to_owned(), node.uid.clone());
+    Ok(node.uid)
 }
 
-fn remote_path(root: &str, relative: &str) -> String {
-    if relative.is_empty() {
-        return root.trim_end_matches('/').to_string();
+fn remote_parent(sync: &SyncConfig, relative: &str, uid: String) -> RemoteParent {
+    RemoteParent {
+        uid,
+        root: sync.remote.clone(),
+        components: if relative.is_empty() {
+            Vec::new()
+        } else {
+            relative.split('/').map(str::to_owned).collect()
+        },
     }
-    let escaped = relative
-        .split('/')
-        .map(escape_remote_segment)
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("{}/{}", root.trim_end_matches('/'), escaped)
-}
-
-fn escape_remote_segment(segment: &str) -> String {
-    segment.replace('\\', "\\\\").replace('/', "\\/")
 }
 
 fn join_relative(parent: &str, name: &str) -> String {
@@ -1117,7 +1522,8 @@ mod tests {
         fail_upload_names: HashSet<String>,
         fail_after_upload: bool,
         info_calls: usize,
-        released_sessions: usize,
+        event_state: HashMap<String, String>,
+        event_cursor: usize,
     }
 
     impl MockDrive {
@@ -1131,6 +1537,10 @@ mod tests {
         fn file_node(path: &str, file: &RemoteFile) -> RemoteNode {
             RemoteNode {
                 uid: file.uid.clone(),
+                parent_uid: path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| format!("uid:{parent}")),
+                tree_event_scope_id: Some("mock-scope".to_owned()),
                 name: ResultValue {
                     ok: true,
                     value: Some(path.rsplit('/').next().unwrap().to_string()),
@@ -1138,14 +1548,14 @@ mod tests {
                 kind: "file".to_string(),
                 total_storage_size: Some(file.claimed_size),
                 active_revision: Some(RemoteRevision {
-                    uid: format!("revision:{path}"),
-                    storage_size: file.claimed_size,
-                    claimed_size: file.claimed_size,
+                    uid: file.revision_uid.clone(),
+                    storage_size: Some(file.claimed_size),
+                    claimed_size: Some(file.claimed_size),
                     claimed_modification_time: None,
-                    claimed_digests: RemoteDigests {
-                        sha1: file.sha1.clone(),
+                    claimed_digests: Some(RemoteDigests {
+                        sha1: Some(file.sha1.clone()),
                         sha1_verified: Some(true),
-                    },
+                    }),
                 }),
             }
         }
@@ -1153,6 +1563,10 @@ mod tests {
         fn folder_node(path: &str) -> RemoteNode {
             RemoteNode {
                 uid: format!("uid:{path}"),
+                parent_uid: path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| format!("uid:{parent}")),
+                tree_event_scope_id: Some("mock-scope".to_owned()),
                 name: ResultValue {
                     ok: true,
                     value: Some(path.rsplit('/').next().unwrap().to_string()),
@@ -1170,6 +1584,7 @@ mod tests {
                 path.clone(),
                 RemoteFile {
                     uid: format!("uid:{path}"),
+                    revision_uid: format!("revision:{path}"),
                     sha1: format!("{:x}", hasher.finalize()),
                     claimed_size: content.len() as u64,
                 },
@@ -1179,7 +1594,16 @@ mod tests {
     }
 
     impl DriveClient for MockDrive {
+        fn reset_cache(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn child(&mut self, parent_uid: &str, name: &str) -> Result<Option<RemoteNode>> {
+            let parent = parent_uid.strip_prefix("uid:").unwrap_or(parent_uid);
+            self.info(&format!("{parent}/{name}"))
+        }
+
         fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteNode>> {
+            let remote_path = remote_path.strip_prefix("uid:").unwrap_or(remote_path);
             let prefix = format!("{}/", remote_path.trim_end_matches('/'));
             let mut nodes = Vec::new();
             for directory in self.directories.clone() {
@@ -1199,6 +1623,7 @@ mod tests {
         }
 
         fn info(&mut self, remote_path: &str) -> Result<Option<RemoteNode>> {
+            let remote_path = remote_path.strip_prefix("uid:").unwrap_or(remote_path);
             self.info_calls += 1;
             if let Some(file) = self.files.get(remote_path) {
                 return Ok(Some(Self::file_node(remote_path, file)));
@@ -1209,17 +1634,23 @@ mod tests {
             Ok(None)
         }
 
-        fn create_folder(&mut self, parent_path: &str, name: &str) -> Result<()> {
-            self.directories
-                .insert(format!("{}/{}", parent_path.trim_end_matches('/'), name));
-            Ok(())
+        fn create_folder(&mut self, parent: &RemoteParent, name: &str) -> Result<RemoteNode> {
+            let parent_path = parent.uid.strip_prefix("uid:").unwrap_or(&parent.uid);
+            let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+            self.directories.insert(path.clone());
+            Ok(Self::folder_node(&path))
         }
 
         fn upload_many(
             &mut self,
-            local_paths: &[PathBuf],
-            remote_parent: &str,
+            uploads: &[LocalUpload],
+            parent: &RemoteParent,
         ) -> Result<UploadBatchResult> {
+            let remote_parent = parent.uid.strip_prefix("uid:").unwrap_or(&parent.uid);
+            let local_paths = uploads
+                .iter()
+                .map(|upload| upload.path.clone())
+                .collect::<Vec<_>>();
             if self.fail_upload {
                 return Ok(UploadBatchResult {
                     failures: local_paths
@@ -1239,7 +1670,7 @@ mod tests {
                     .collect(),
             );
             let mut result = UploadBatchResult::default();
-            for local_path in local_paths {
+            for local_path in &local_paths {
                 let name = local_path.file_name().unwrap().to_string_lossy();
                 if self.fail_upload_names.contains(name.as_ref()) {
                     result.failures.push(UploadFailure {
@@ -1257,17 +1688,24 @@ mod tests {
                     .is_some_and(|file| file.sha1 == digest && file.claimed_size == metadata.len())
                 {
                     result.skipped_items += 1;
+                    result
+                        .nodes
+                        .push(Self::file_node(&path, &self.files[&path]));
                     continue;
                 }
                 self.files.insert(
                     path.clone(),
                     RemoteFile {
                         uid: format!("uid:{path}"),
+                        revision_uid: format!("revision:{path}"),
                         sha1: digest,
                         claimed_size: metadata.len(),
                     },
                 );
                 self.contents.insert(path.clone(), fs::read(local_path)?);
+                result
+                    .nodes
+                    .push(Self::file_node(&path, &self.files[&path]));
                 self.uploads.push(path);
                 result.transferred_items += 1;
                 result.transferred_bytes += metadata.len();
@@ -1278,7 +1716,8 @@ mod tests {
             Ok(result)
         }
 
-        fn download(&mut self, remote_path: &str, local_parent: &Path) -> Result<()> {
+        fn download(&mut self, remote: &RemoteFile, local_parent: &Path) -> Result<()> {
+            let remote_path = remote.uid.strip_prefix("uid:").unwrap_or(&remote.uid);
             let content = self
                 .contents
                 .get(remote_path)
@@ -1296,14 +1735,33 @@ mod tests {
             self.trash_batches.push(
                 targets
                     .iter()
-                    .map(|target| target.remote_path.clone())
+                    .map(|target| {
+                        format!(
+                            "{}/{}",
+                            target
+                                .parent
+                                .uid
+                                .strip_prefix("uid:")
+                                .unwrap_or(&target.parent.uid),
+                            target.name
+                        )
+                    })
                     .collect(),
             );
             let mut result = TrashBatchResult::default();
             for target in targets {
-                if self.files.remove(&target.remote_path).is_some() {
-                    self.contents.remove(&target.remote_path);
-                    self.trashed.push(target.remote_path.clone());
+                let path = format!(
+                    "{}/{}",
+                    target
+                        .parent
+                        .uid
+                        .strip_prefix("uid:")
+                        .unwrap_or(&target.parent.uid),
+                    target.name
+                );
+                if self.files.remove(&path).is_some() {
+                    self.contents.remove(&path);
+                    self.trashed.push(path);
                     result.succeeded_uids.push(target.uid.clone());
                 } else {
                     result.failed_uids.push(target.uid.clone());
@@ -1312,9 +1770,52 @@ mod tests {
             Ok(result)
         }
 
-        fn release_session(&mut self) -> Result<()> {
-            self.released_sessions += 1;
-            Ok(())
+        fn events(&mut self, _: &str, cursor: Option<&str>) -> Result<RemoteEvents> {
+            let mut current = self
+                .directories
+                .iter()
+                .map(|path| (format!("uid:{path}"), "folder".to_owned()))
+                .collect::<HashMap<_, _>>();
+            current.extend(
+                self.files
+                    .iter()
+                    .map(|(path, file)| (format!("uid:{path}"), file.sha1.clone())),
+            );
+            let mut events = Vec::new();
+            if cursor.is_some() {
+                for (uid, fingerprint) in &current {
+                    if self.event_state.get(uid) != Some(fingerprint) {
+                        events.push(RemoteEvent {
+                            kind: "node_updated".to_owned(),
+                            node_uid: Some(uid.clone()),
+                            parent_node_uid: None,
+                            is_trashed: Some(false),
+                        });
+                    }
+                }
+                for uid in self
+                    .event_state
+                    .keys()
+                    .filter(|uid| !current.contains_key(*uid))
+                {
+                    events.push(RemoteEvent {
+                        kind: "node_deleted".to_owned(),
+                        node_uid: Some(uid.clone()),
+                        parent_node_uid: None,
+                        is_trashed: None,
+                    });
+                }
+            }
+            if current != self.event_state || self.event_cursor == 0 {
+                self.event_cursor += 1;
+            }
+            self.event_state = current;
+            Ok(RemoteEvents {
+                cursor: self.event_cursor.to_string(),
+                events,
+                refresh: false,
+                removed: false,
+            })
         }
     }
 
@@ -1368,6 +1869,7 @@ mod tests {
         drive.files.insert(
             format!("{}/already-there.txt", fixture.mirror.remote),
             RemoteFile {
+                revision_uid: "mock-revision".to_owned(),
                 uid: format!("uid:{}/already-there.txt", fixture.mirror.remote),
                 sha1: sha1_file(&path).unwrap(),
                 claimed_size: fs::metadata(path).unwrap().len(),
@@ -1426,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn push_reconciles_files_in_bounded_batches_without_remote_info_calls() {
+    fn push_reconciles_files_in_bounded_batches_without_per_file_lookups() {
         let fixture = Fixture::new();
         for index in 0..(UPLOAD_BATCH_SIZE + 1) {
             fixture.write(&format!("file-{index:02}.txt"), "content");
@@ -1436,7 +1938,7 @@ mod tests {
         let summary = sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
 
         assert_eq!(summary.uploaded, UPLOAD_BATCH_SIZE + 1);
-        assert_eq!(drive.info_calls, 0);
+        assert_eq!(drive.info_calls, 2);
         assert_eq!(
             drive
                 .upload_batches
@@ -1449,7 +1951,7 @@ mod tests {
             all_file_states(&fixture.connection, &fixture.mirror.name)
                 .unwrap()
                 .values()
-                .all(|state| state.sha1.is_empty())
+                .all(|state| !state.sha1.is_empty())
         );
     }
 
@@ -1550,6 +2052,7 @@ mod tests {
         drive.files.insert(
             format!("{}/remote-only.txt", fixture.mirror.remote),
             RemoteFile {
+                revision_uid: "mock-revision".to_owned(),
                 uid: format!("uid:{}/remote-only.txt", fixture.mirror.remote),
                 sha1: "unknown".to_string(),
                 claimed_size: 7,
@@ -1570,6 +2073,7 @@ mod tests {
         drive.files.insert(
             format!("{}/remote-only.txt", fixture.mirror.remote),
             RemoteFile {
+                revision_uid: "mock-revision".to_owned(),
                 uid: format!("uid:{}/remote-only.txt", fixture.mirror.remote),
                 sha1: "unknown".to_string(),
                 claimed_size: 7,
@@ -1659,13 +2163,13 @@ mod tests {
     }
 
     #[test]
-    fn two_way_rebuilds_the_digest_omitted_by_push() {
+    fn two_way_reuses_the_sdk_digest_from_push() {
         let mut fixture = Fixture::new();
         fixture.write("shared.txt", "content");
         let mut drive = MockDrive::with_root(&fixture.mirror.remote);
         sync_push(&fixture.mirror, &fixture.connection, &mut drive).unwrap();
         assert!(
-            file_state(&fixture.connection, &fixture.mirror.name, "shared.txt")
+            !file_state(&fixture.connection, &fixture.mirror.name, "shared.txt")
                 .unwrap()
                 .unwrap()
                 .sha1
@@ -1784,8 +2288,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.mirror.exclude = vec!["[".to_owned()];
         let config = Config {
-            proton_drive_bin: PathBuf::from("proton-drive"),
-            optimize_cli_cache: true,
+            sdk_bin: PathBuf::from("pdrive-sync-sdk"),
             notifications: true,
             state_db: None,
             success_file: None,
@@ -1836,153 +2339,5 @@ mod tests {
         assert_eq!(config.syncs[0].delete, DeletePolicy::Keep);
         assert_eq!(config.syncs[1].delete, DeletePolicy::Trash);
         assert_eq!(config.syncs[2].conflict, ConflictPolicy::Fail);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cli_drive_reuses_one_repl_process() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let script = temp.path().join("fake proton drive");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env bash
-count=0
-printf 'proton-drive> '
-while IFS= read -r command; do
-    if [ "$command" = exit ]; then
-        exit 0
-    fi
-    count=$((count + 1))
-    if [ "$count" -eq 1 ]; then
-        printf '[]\n'
-    else
-        printf '[{"uid":"same-session","name":{"ok":true,"value":"folder"},"type":"folder"}]\n'
-    fi
-    printf 'proton-drive> '
-done
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut drive = CliDrive::new(script);
-
-        assert!(drive.list("/my-files/one").unwrap().is_empty());
-        let second = drive.list("/my-files/two").unwrap();
-
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].uid, "same-session");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cli_drive_uses_one_shot_for_newline_arguments() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let script = temp.path().join("fake-proton-drive");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env bash
-if [[ "$*" != *$'\n'* ]]; then
-    printf 'newline argument was not preserved\n' >&2
-    exit 2
-fi
-printf '{"transferredItems":1,"failedItems":0}\n'
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let local = temp.path().join("line\nbreak.txt");
-        fs::write(&local, "content").unwrap();
-        let mut drive = CliDrive::new(script);
-
-        drive.upload_many(&[local], "/my-files/target").unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cli_drive_maps_batch_transfer_and_trash_results() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let script = temp.path().join("fake-proton-drive");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env bash
-case "$2" in
-    upload)
-        printf '%s\n' '{"transferredItems":1,"transferredBytes":7,"skippedItems":0,"failedItems":1,"failures":[{"name":"retry\nfile.txt","error":"No space"}]}'
-        ;;
-    trash)
-        printf '%s\n' '[{"uid":"one","ok":true},{"uid":"two","ok":false}]'
-        ;;
-    *)
-        exit 2
-        ;;
-esac
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let good = temp.path().join("good.txt");
-        let retry = temp.path().join("retry\nfile.txt");
-        fs::write(&good, "content").unwrap();
-        fs::write(&retry, "content").unwrap();
-        let mut drive = CliDrive::new(script);
-
-        let upload = drive
-            .upload_many(&[good, retry], "/my-files/target")
-            .unwrap();
-        let trash = drive
-            .trash_many(&[
-                TrashTarget {
-                    remote_path: "/my-files/one\n".to_owned(),
-                    uid: "one".to_owned(),
-                },
-                TrashTarget {
-                    remote_path: "/my-files/two".to_owned(),
-                    uid: "two".to_owned(),
-                },
-            ])
-            .unwrap();
-
-        assert_eq!(upload.transferred_items, 1);
-        assert_eq!(upload.transferred_bytes, 7);
-        assert_eq!(upload.failures.len(), 1);
-        assert_eq!(upload.failures[0].name, "retry\nfile.txt");
-        assert_eq!(trash.succeeded_uids, vec!["one"]);
-        assert_eq!(trash.failed_uids, vec!["two"]);
-    }
-
-    #[test]
-    fn repl_arguments_are_quoted_without_shell_interpolation() {
-        assert_eq!(
-            quote_repl_argument("space \" quote \\ slash $HOME"),
-            "\"space \\\" quote \\\\ slash $HOME\""
-        );
-        assert!(reject_repl_newlines(&["line\nbreak"]).is_err());
-    }
-
-    #[test]
-    fn proton_cli_caches_are_switched_to_wal() {
-        let temp = TempDir::new().unwrap();
-        for name in ["cache-entities.sqlite", "cache-crypto.sqlite"] {
-            let connection = Connection::open(temp.path().join(name)).unwrap();
-            connection
-                .execute("CREATE TABLE entities (key TEXT PRIMARY KEY)", [])
-                .unwrap();
-        }
-
-        assert_eq!(optimize_cli_cache_dir(temp.path()).unwrap(), 2);
-
-        for name in ["cache-entities.sqlite", "cache-crypto.sqlite"] {
-            let connection = Connection::open(temp.path().join(name)).unwrap();
-            let mode: String = connection
-                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(mode, "wal");
-        }
     }
 }

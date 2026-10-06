@@ -1,0 +1,18 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "pdrive-sync-sdk-build-dependencies",
+      "dependencies": {
+        "@boltffi/runtime": "0.31.0",
+        "comlink": "4.4.2",
+      },
+    },
+  },
+  "packages": {
+    "@boltffi/runtime": ["@boltffi/runtime@0.31.0", "", {}, "sha512-nxht21tsG0KLzkdN2gHqSAZv7Ainht5v/Q6ZGVT8xXAmJKdewk4PwwryLeQR4xrejwDOtuWRD7p7OGkKGw8JIQ=="],
+
+    "comlink": ["comlink@4.4.2", "", {}, "sha512-OxGdvBmJuNKSCMO4NTl1L47VRp6xn2wG4F/2hYzB6tiCb709otOxtEYCSvK80PtjODfXXZu8ds+Nw5kVCjqd2g=="],
+  }
+}

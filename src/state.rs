@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+use crate::SyncConfig;
+use crate::drive::RemoteNode;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +15,13 @@ pub(crate) struct FileState {
     pub(crate) size: u64,
     pub(crate) mtime_ns: i64,
     pub(crate) sha1: String,
+}
+
+pub(crate) struct RemoteSnapshot {
+    pub root_uid: String,
+    pub scope_id: String,
+    pub cursor: String,
+    pub nodes: HashMap<String, RemoteNode>,
 }
 
 pub fn default_state_dir() -> Result<PathBuf> {
@@ -45,14 +54,28 @@ pub fn open_database(path: &Path) -> Result<Connection> {
             sha1 TEXT NOT NULL,
             PRIMARY KEY (mirror, path)
         );
-        CREATE TABLE IF NOT EXISTS remote_directories (
-            mirror TEXT NOT NULL,
-            path TEXT NOT NULL,
-            PRIMARY KEY (mirror, path)
-        );
+        DROP TABLE IF EXISTS remote_directories;
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_identities (
+            mirror TEXT PRIMARY KEY,
+            local_root TEXT NOT NULL,
+            remote_root TEXT NOT NULL,
+            root_uid TEXT
+        );
+        CREATE TABLE IF NOT EXISTS remote_snapshots (
+            mirror TEXT PRIMARY KEY,
+            root_uid TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            cursor TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS remote_nodes (
+            mirror TEXT NOT NULL,
+            uid TEXT NOT NULL,
+            node_json TEXT NOT NULL,
+            PRIMARY KEY (mirror, uid)
         );
         ",
     )?;
@@ -104,28 +127,6 @@ pub(crate) fn all_file_states(
     Ok(states)
 }
 
-fn save_file_state(
-    connection: &Connection,
-    mirror: &str,
-    path: &str,
-    size: u64,
-    mtime_ns: i64,
-    sha1: &str,
-) -> Result<()> {
-    connection.execute(
-        "
-        INSERT INTO files (mirror, path, size, mtime_ns, sha1)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT (mirror, path) DO UPDATE SET
-            size = excluded.size,
-            mtime_ns = excluded.mtime_ns,
-            sha1 = excluded.sha1
-        ",
-        params![mirror, path, size, mtime_ns, sha1],
-    )?;
-    Ok(())
-}
-
 #[derive(Debug)]
 struct FileCheckpoint {
     mirror: String,
@@ -174,19 +175,51 @@ impl<'connection> CheckpointBatch<'connection> {
     }
 
     pub(crate) fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        self.flush_batch(None)
+    }
+
+    pub(crate) fn flush_with_remote_nodes(
+        &mut self,
+        mirror: &str,
+        nodes: &[RemoteNode],
+    ) -> Result<()> {
+        self.flush_batch(Some((mirror, nodes)))
+    }
+
+    fn flush_batch(&mut self, remote: Option<(&str, &[RemoteNode])>) -> Result<()> {
+        if self.pending.is_empty() && remote.is_none_or(|(_, nodes)| nodes.is_empty()) {
             return Ok(());
         }
         let transaction = self.connection.unchecked_transaction()?;
-        for checkpoint in &self.pending {
-            save_file_state(
-                &transaction,
-                &checkpoint.mirror,
-                &checkpoint.path,
-                checkpoint.size,
-                checkpoint.mtime_ns,
-                &checkpoint.sha1,
+        {
+            let mut statement = transaction.prepare(
+                "
+                INSERT INTO files (mirror, path, size, mtime_ns, sha1)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT (mirror, path) DO UPDATE SET
+                    size = excluded.size,
+                    mtime_ns = excluded.mtime_ns,
+                    sha1 = excluded.sha1
+                WHERE files.size != excluded.size
+                    OR files.mtime_ns != excluded.mtime_ns
+                    OR files.sha1 != excluded.sha1
+                ",
             )?;
+            for checkpoint in &self.pending {
+                statement.execute(params![
+                    checkpoint.mirror,
+                    checkpoint.path,
+                    checkpoint.size,
+                    checkpoint.mtime_ns,
+                    checkpoint.sha1,
+                ])?;
+            }
+        }
+        if let Some((mirror, nodes)) = remote {
+            let mut statement = transaction.prepare(SAVE_REMOTE_NODE)?;
+            for node in nodes {
+                statement.execute(params![mirror, node.uid, serde_json::to_string(node)?])?;
+            }
         }
         transaction.commit()?;
         self.pending.clear();
@@ -199,10 +232,189 @@ impl<'connection> CheckpointBatch<'connection> {
 }
 
 pub(crate) fn delete_file_state(connection: &Connection, mirror: &str, path: &str) -> Result<()> {
-    connection.execute(
-        "DELETE FROM files WHERE mirror = ?1 AND path = ?2",
-        params![mirror, path],
+    delete_file_states_and_remote_nodes(connection, mirror, &[path.to_owned()], &[])
+}
+
+pub(crate) fn delete_file_states_and_remote_nodes(
+    connection: &Connection,
+    mirror: &str,
+    paths: &[String],
+    uids: &[String],
+) -> Result<()> {
+    if paths.is_empty() && uids.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    {
+        let mut statement =
+            transaction.prepare("DELETE FROM files WHERE mirror = ?1 AND path = ?2")?;
+        for path in paths {
+            statement.execute(params![mirror, path])?;
+        }
+        let mut statement =
+            transaction.prepare("DELETE FROM remote_nodes WHERE mirror = ?1 AND uid = ?2")?;
+        for uid in uids {
+            statement.execute(params![mirror, uid])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn bind_sync(
+    connection: &Connection,
+    sync: &SyncConfig,
+    root_uid: Option<&str>,
+) -> Result<bool> {
+    let local_root = fs::canonicalize(&sync.local)
+        .or_else(|_| std::path::absolute(&sync.local))?
+        .to_string_lossy()
+        .into_owned();
+    let transaction = connection.unchecked_transaction()?;
+    let previous = transaction
+        .query_row(
+            "SELECT local_root, remote_root, root_uid FROM sync_identities WHERE mirror = ?1",
+            [&sync.name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let changed = previous.as_ref().is_some_and(|(local, remote, uid)| {
+        local != &local_root
+            || remote != &sync.remote
+            || uid
+                .as_deref()
+                .zip(root_uid)
+                .is_some_and(|(previous_uid, current_uid)| previous_uid != current_uid)
+    });
+    if changed {
+        transaction.execute("DELETE FROM files WHERE mirror = ?1", [&sync.name])?;
+        transaction.execute(
+            "DELETE FROM metadata WHERE key = ?1",
+            [format!("baseline:{}", sync.name)],
+        )?;
+        transaction.execute("DELETE FROM remote_nodes WHERE mirror = ?1", [&sync.name])?;
+        transaction.execute(
+            "DELETE FROM remote_snapshots WHERE mirror = ?1",
+            [&sync.name],
+        )?;
+    }
+    let retained_uid = previous
+        .as_ref()
+        .and_then(|(_, _, uid)| uid.as_deref())
+        .filter(|_| !changed);
+    transaction.execute(
+        "
+        INSERT INTO sync_identities (mirror, local_root, remote_root, root_uid)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT (mirror) DO UPDATE SET
+            local_root = excluded.local_root,
+            remote_root = excluded.remote_root,
+            root_uid = excluded.root_uid
+        WHERE sync_identities.local_root != excluded.local_root
+            OR sync_identities.remote_root != excluded.remote_root
+            OR sync_identities.root_uid IS NOT excluded.root_uid
+        ",
+        params![
+            sync.name,
+            local_root,
+            sync.remote,
+            root_uid.or(retained_uid)
+        ],
     )?;
+    transaction.commit()?;
+    Ok(changed)
+}
+
+pub(crate) fn remote_snapshot(
+    connection: &Connection,
+    mirror: &str,
+) -> Result<Option<RemoteSnapshot>> {
+    let snapshot = connection
+        .query_row(
+            "SELECT root_uid, scope_id, cursor FROM remote_snapshots WHERE mirror = ?1",
+            [mirror],
+            |row| {
+                Ok(RemoteSnapshot {
+                    root_uid: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    cursor: row.get(2)?,
+                    nodes: HashMap::new(),
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let mut statement =
+        connection.prepare("SELECT uid, node_json FROM remote_nodes WHERE mirror = ?1")?;
+    let rows = statement.query_map([mirror], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (uid, json) = row?;
+        let node = serde_json::from_str(&json)
+            .with_context(|| format!("failed to read cached remote node {uid}"))?;
+        snapshot.nodes.insert(uid, node);
+    }
+    Ok(Some(snapshot))
+}
+
+const SAVE_REMOTE_NODE: &str = "
+    INSERT INTO remote_nodes (mirror, uid, node_json) VALUES (?1, ?2, ?3)
+    ON CONFLICT (mirror, uid) DO UPDATE SET node_json = excluded.node_json
+    WHERE remote_nodes.node_json != excluded.node_json
+";
+
+pub(crate) fn replace_remote_snapshot(
+    connection: &Connection,
+    mirror: &str,
+    snapshot: &RemoteSnapshot,
+) -> Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    {
+        let mut statement =
+            transaction.prepare("SELECT uid FROM remote_nodes WHERE mirror = ?1")?;
+        let rows = statement.query_map([mirror], |row| row.get::<_, String>(0))?;
+        let previous_uids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut save = transaction.prepare(SAVE_REMOTE_NODE)?;
+        for (uid, node) in &snapshot.nodes {
+            save.execute(params![mirror, uid, serde_json::to_string(node)?])?;
+        }
+        let mut delete =
+            transaction.prepare("DELETE FROM remote_nodes WHERE mirror = ?1 AND uid = ?2")?;
+        for uid in previous_uids {
+            if !snapshot.nodes.contains_key(&uid) {
+                delete.execute(params![mirror, uid])?;
+            }
+        }
+    }
+    transaction.execute(
+        "
+        INSERT INTO remote_snapshots (mirror, root_uid, scope_id, cursor)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT (mirror) DO UPDATE SET
+            root_uid = excluded.root_uid,
+            scope_id = excluded.scope_id,
+            cursor = excluded.cursor
+        WHERE remote_snapshots.root_uid != excluded.root_uid
+            OR remote_snapshots.scope_id != excluded.scope_id
+            OR remote_snapshots.cursor != excluded.cursor
+        ",
+        params![
+            mirror,
+            snapshot.root_uid,
+            snapshot.scope_id,
+            snapshot.cursor
+        ],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -238,53 +450,9 @@ pub(crate) fn set_metadata(connection: &Connection, key: &str, value: &str) -> R
         "
         INSERT INTO metadata (key, value) VALUES (?1, ?2)
         ON CONFLICT (key) DO UPDATE SET value = excluded.value
+        WHERE metadata.value != excluded.value
         ",
         params![key, value],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn replace_remote_directories(
-    connection: &Connection,
-    mirror: &str,
-    directories: &HashSet<String>,
-) -> Result<()> {
-    let transaction = connection.unchecked_transaction()?;
-    transaction.execute("DELETE FROM remote_directories WHERE mirror = ?1", [mirror])?;
-    for path in directories {
-        transaction.execute(
-            "INSERT INTO remote_directories (mirror, path) VALUES (?1, ?2)",
-            params![mirror, path],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-pub(crate) fn remote_directory_known(
-    connection: &Connection,
-    mirror: &str,
-    path: &str,
-) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT 1 FROM remote_directories WHERE mirror = ?1 AND path = ?2",
-            params![mirror, path],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|value| value.is_some())
-        .map_err(Into::into)
-}
-
-pub(crate) fn save_remote_directory(
-    connection: &Connection,
-    mirror: &str,
-    path: &str,
-) -> Result<()> {
-    connection.execute(
-        "INSERT OR IGNORE INTO remote_directories (mirror, path) VALUES (?1, ?2)",
-        params![mirror, path],
     )?;
     Ok(())
 }

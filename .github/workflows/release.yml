@@ -16,19 +16,27 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: x86_64-linux-gnu
+            bun-target: bun-linux-x64-baseline
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: aarch64-linux-gnu
+            bun-target: bun-linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --locked --release --target "${{ matrix.target }}"
+      - run: SDK_OUTPUT_DIR=target/sdk-release sdk/build.sh "${{ matrix.bun-target }}"
       - name: Package
         run: |
           archive="pdrive-sync-rs-${{ matrix.asset }}.tar.gz"
           cp "target/${{ matrix.target }}/release/pdrive-sync" pdrive-sync
-          tar -czf "$archive" pdrive-sync README.md LICENSE
+          cp target/sdk-release/pdrive-sync-sdk pdrive-sync-sdk
+          cp target/sdk-release/PROTON-SDK-LICENSE.md PROTON-SDK-LICENSE.md
+          tar -czf "$archive" pdrive-sync pdrive-sync-sdk README.md LICENSE PROTON-SDK-LICENSE.md
       - uses: actions/upload-artifact@v7
         with:
           name: pdrive-sync-rs-${{ matrix.asset }}

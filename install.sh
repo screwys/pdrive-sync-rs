@@ -19,10 +19,12 @@ fi
 repository="${PDRIVE_SYNC_REPOSITORY:-screwys/pdrive-sync-rs}"
 install_dir="${PDRIVE_SYNC_INSTALL_DIR:-$HOME/.local/bin}"
 binary="$install_dir/pdrive-sync"
+helper="$install_dir/pdrive-sync-sdk"
 legacy_binary="$install_dir/pdrive-sync-rs"
 replacement="$install_dir/.pdrive-sync.$$"
+helper_replacement="$install_dir/.pdrive-sync-sdk.$$"
 temporary_dir="$(mktemp -d)"
-trap 'rm -rf "$temporary_dir"; rm -f "$replacement"' EXIT HUP INT TERM
+trap 'rm -rf "$temporary_dir"; rm -f "$replacement" "$helper_replacement"' EXIT HUP INT TERM
 
 if [ "$setup" = true ] && ! (: </dev/tty) 2>/dev/null; then
     printf 'pdrive-sync: installation needs an interactive terminal for setup\n' >&2
@@ -40,32 +42,26 @@ esac
 
 release="https://github.com/$repository/releases/latest/download"
 archive="pdrive-sync-rs-$platform.tar.gz"
-if curl -fL "$release/$archive" -o "$temporary_dir/$archive"; then
-    (
-        cd "$temporary_dir"
-        tar -xzf "$archive"
-    )
-    if [ -f "$temporary_dir/pdrive-sync" ]; then
-        source_binary="$temporary_dir/pdrive-sync"
-    else
-        source_binary="$temporary_dir/pdrive-sync-rs"
-    fi
-elif command -v cargo >/dev/null 2>&1; then
-    printf 'No release archive was found; building the current main branch with Cargo.\n'
-    cargo install \
-        --locked \
-        --git "https://github.com/$repository" \
-        --root "$temporary_dir/cargo"
-    source_binary="$temporary_dir/cargo/bin/pdrive-sync"
-else
-    printf 'pdrive-sync: no release archive is available and Cargo is not installed\n' >&2
+if ! curl -fL "$release/$archive" -o "$temporary_dir/$archive"; then
+    printf 'pdrive-sync: no release archive is available for %s\n' "$platform" >&2
+    exit 1
+fi
+(
+    cd "$temporary_dir"
+    tar -xzf "$archive"
+)
+source_binary="$temporary_dir/pdrive-sync"
+source_helper="$temporary_dir/pdrive-sync-sdk"
+if [ ! -f "$source_binary" ] || [ ! -f "$source_helper" ]; then
+    printf 'pdrive-sync: this release does not include both pdrive-sync and pdrive-sync-sdk\n' >&2
     exit 1
 fi
 
 if [ -n "${PDRIVE_SYNC_CURRENT_VERSION:-}" ]; then
     candidate_version="$("$source_binary" --version)"
     candidate_version="${candidate_version##* }"
-    if [ "$candidate_version" = "$PDRIVE_SYNC_CURRENT_VERSION" ]; then
+    if [ "$candidate_version" = "$PDRIVE_SYNC_CURRENT_VERSION" ] && \
+        [ -x "$helper" ] && [ "$("$helper" --version)" = "$("$source_helper" --version)" ]; then
         printf 'pdrive-sync %s is already up to date\n' "$candidate_version"
         exit 0
     fi
@@ -73,6 +69,8 @@ fi
 
 install -d "$install_dir"
 install -m 0755 "$source_binary" "$replacement"
+install -m 0755 "$source_helper" "$helper_replacement"
+mv -f "$helper_replacement" "$helper"
 mv -f "$replacement" "$binary"
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"

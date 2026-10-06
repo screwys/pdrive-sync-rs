@@ -1,0 +1,8 @@
+{
+  "name": "pdrive-sync-sdk-build-dependencies",
+  "private": true,
+  "dependencies": {
+    "@boltffi/runtime": "0.31.0",
+    "comlink": "4.4.2"
+  }
+}

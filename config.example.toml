@@ -1,5 +1,5 @@
-# Use an absolute path here if proton-drive is not on PATH.
-proton_drive_bin = "proton-drive"
+# By default, the SDK helper is next to pdrive-sync. Set its path to override it.
+# sdk_bin = "/home/me/.local/bin/pdrive-sync-sdk"
 
 # A failed run sends a desktop notification after 24 hours without a success.
 notifications = true
