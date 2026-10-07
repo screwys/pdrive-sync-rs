@@ -11,9 +11,10 @@ pub use drive::{
 #[cfg(test)]
 use state::CHECKPOINT_BATCH_SIZE;
 use state::{
-    CheckpointBatch, FileState, RemoteSnapshot, all_file_states, bind_sync, delete_file_state,
-    delete_file_states_and_remote_nodes, file_state, metadata_value, remote_snapshot,
-    replace_remote_snapshot, set_metadata, stale_paths,
+    CheckpointBatch, FileState, RemoteScan, RemoteSnapshot, all_file_states, bind_sync,
+    clear_remote_scan, delete_file_state, delete_file_states_and_remote_nodes, file_state,
+    metadata_value, remote_scan, remote_snapshot, replace_remote_snapshot, save_remote_scan,
+    set_metadata, stale_paths,
 };
 pub use state::{default_state_dir, open_database, write_success_file};
 
@@ -1069,16 +1070,32 @@ fn inventory_remote(
     let excludes = build_excludes(sync)?;
     bind_sync(connection, sync, None)?;
     let mut cached = remote_snapshot(connection, &sync.name)?;
-    if cached.is_none() {
+    let mut scan = remote_scan(connection, &sync.name)?;
+    if scan
+        .as_ref()
+        .is_some_and(|scan| scan.excludes != sync.exclude)
+    {
+        clear_remote_scan(connection, &sync.name)?;
+        scan = None;
+    }
+    if cached.is_none() && scan.is_none() {
         drive.reset_cache()?;
     }
-    // Process saved events before resolving names through the SDK's node cache.
-    let changes = cached
+    // Replay saved events before resolving names through the SDK's node cache.
+    let changes = if let Some(snapshot) = &cached {
+        Some(drive.events(&snapshot.scope_id, Some(&snapshot.cursor))?)
+    } else if let Some(scan) = &scan {
+        Some(drive.events(&scan.scope_id, Some(&scan.cursor))?)
+    } else {
+        None
+    };
+    if changes
         .as_ref()
-        .map(|snapshot| drive.events(&snapshot.scope_id, Some(&snapshot.cursor)))
-        .transpose()?;
-    if changes.as_ref().is_some_and(|changes| changes.removed) {
+        .is_some_and(|changes| changes.removed || changes.refresh)
+    {
         drive.reset_cache()?;
+        clear_remote_scan(connection, &sync.name)?;
+        scan = None;
     }
     let root = drive
         .info(&sync.remote)?
@@ -1092,6 +1109,7 @@ fn inventory_remote(
         .context("remote root has no event scope")?;
     if bind_sync(connection, sync, Some(&root.uid))? {
         cached = None;
+        scan = None;
     }
     let filters_key = format!("remote-excludes:{}", sync.name);
     let filters = serde_json::to_string(&sync.exclude)?;
@@ -1105,6 +1123,8 @@ fn inventory_remote(
         })
     }) {
         cached = None;
+        scan = None;
+        clear_remote_scan(connection, &sync.name)?;
     }
     let verify_root = cached.is_none()
         || changes.as_ref().is_some_and(|changes| {
@@ -1131,19 +1151,41 @@ fn inventory_remote(
             snapshot
         }
         _ => {
-            let start = drive.events(&scope, None)?;
-            if start.removed {
-                bail!("remote sync tree is no longer accessible");
-            }
+            let scan = match scan {
+                Some(scan) if scan.root_uid == root.uid && scan.scope_id == scope => scan,
+                _ => {
+                    let start = drive.events(&scope, None)?;
+                    if start.removed {
+                        bail!("remote sync tree is no longer accessible");
+                    }
+                    let scan = RemoteScan {
+                        root_uid: root.uid.clone(),
+                        scope_id: scope,
+                        cursor: start.cursor,
+                        excludes: sync.exclude.clone(),
+                    };
+                    save_remote_scan(connection, &sync.name, &scan)?;
+                    scan
+                }
+            };
             let mut snapshot = RemoteSnapshot {
                 root_uid: root.uid.clone(),
-                scope_id: scope,
-                cursor: start.cursor,
+                scope_id: scan.scope_id,
+                cursor: scan.cursor,
                 nodes: HashMap::new(),
             };
-            load_remote_nodes(drive, &root, "", &excludes, &mut snapshot.nodes)?;
+            let mut next_progress = 1000;
+            load_remote_nodes(
+                drive,
+                &root,
+                "",
+                &excludes,
+                &mut snapshot.nodes,
+                &mut next_progress,
+            )?;
             let changes = drive.events(&snapshot.scope_id, Some(&snapshot.cursor))?;
             if changes.refresh || changes.removed {
+                clear_remote_scan(connection, &sync.name)?;
                 bail!("remote tree needs a new inventory; retry the sync");
             }
             apply_remote_events(drive, &excludes, &mut snapshot, changes)?;
@@ -1200,6 +1242,7 @@ fn load_remote_nodes(
     relative: &str,
     excludes: &GlobSet,
     nodes: &mut HashMap<String, RemoteNode>,
+    next_progress: &mut usize,
 ) -> Result<()> {
     nodes.insert(root.uid.clone(), root.clone());
     for mut node in drive.list(&root.uid)? {
@@ -1211,15 +1254,16 @@ fn load_remote_nodes(
         }
         node.parent_uid = Some(root.uid.clone());
         if node.kind == "folder" {
-            load_remote_nodes(drive, &node, &path, excludes, nodes)?;
-            if nodes.len().is_multiple_of(250) {
-                eprintln!(
-                    "[pdrive-sync] remote inventory: {} nodes listed",
-                    nodes.len()
-                );
-            }
+            load_remote_nodes(drive, &node, &path, excludes, nodes, next_progress)?;
         } else {
             nodes.insert(node.uid.clone(), node);
+        }
+        if nodes.len() >= *next_progress {
+            eprintln!(
+                "[pdrive-sync] remote inventory: {} nodes listed",
+                nodes.len()
+            );
+            *next_progress = (nodes.len() / 1000 + 1) * 1000;
         }
     }
     Ok(())
@@ -1332,7 +1376,15 @@ fn apply_remote_events(
             for uid in new_folders.into_iter().rev() {
                 if let Some(relative) = remote_relative(&uid, snapshot)? {
                     let folder = snapshot.nodes[&uid].clone();
-                    load_remote_nodes(drive, &folder, &relative, excludes, &mut snapshot.nodes)?;
+                    let mut next_progress = (snapshot.nodes.len() / 1000 + 1) * 1000;
+                    load_remote_nodes(
+                        drive,
+                        &folder,
+                        &relative,
+                        excludes,
+                        &mut snapshot.nodes,
+                        &mut next_progress,
+                    )?;
                     break;
                 }
             }

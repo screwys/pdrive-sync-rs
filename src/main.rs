@@ -600,7 +600,7 @@ fn openrc_service(binary: &Path, config: &Path, interval: Duration) -> String {
 
 fn systemd_units(binary: &Path, config: &Path, interval: Duration) -> (String, String) {
     let service = format!(
-        "[Unit]\nDescription=Sync configured folders with Proton Drive\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nEnvironment=PATH=%h/.local/bin:%h/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\nEnvironment=PROTON_DRIVE_LOG_LEVEL=WARNING\nExecStart={} --config {} sync\nNice=10\nCPUWeight=25\nIOWeight=25\nMemoryHigh=512M\n",
+        "[Unit]\nDescription=Sync configured folders with Proton Drive\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nEnvironment=PATH=%h/.local/bin:%h/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\nEnvironment=PROTON_DRIVE_LOG_LEVEL=WARNING\nExecStart={} --config {} sync\nNice=10\nCPUWeight=25\nIOWeight=25\n",
         systemd_quote(binary),
         systemd_quote(config)
     );
@@ -848,7 +848,6 @@ mod tests {
         assert!(systemd_service.contains("\"/home/user name/.local/bin/pdrive-sync\""));
         assert!(systemd_service.contains("%h/.local/bin"));
         assert!(systemd_timer.contains("OnUnitInactiveSec=3600s"));
-        assert!(systemd_service.contains("MemoryHigh=512M"));
         assert!(dinit.contains("\"/home/user name/.local/bin/pdrive-sync\""));
         assert!(dinit.contains("daemon"));
         assert!(openrc.contains("supervisor=supervise-daemon"));

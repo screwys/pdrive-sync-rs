@@ -24,6 +24,14 @@ pub(crate) struct RemoteSnapshot {
     pub nodes: HashMap<String, RemoteNode>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RemoteScan {
+    pub root_uid: String,
+    pub scope_id: String,
+    pub cursor: String,
+    pub excludes: Vec<String>,
+}
+
 pub fn default_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path).join("pdrive-sync"));
@@ -295,8 +303,12 @@ pub(crate) fn bind_sync(
     if changed {
         transaction.execute("DELETE FROM files WHERE mirror = ?1", [&sync.name])?;
         transaction.execute(
-            "DELETE FROM metadata WHERE key = ?1",
-            [format!("baseline:{}", sync.name)],
+            "DELETE FROM metadata WHERE key IN (?1, ?2, ?3)",
+            params![
+                format!("baseline:{}", sync.name),
+                format!("remote-excludes:{}", sync.name),
+                format!("remote-scan:{}", sync.name)
+            ],
         )?;
         transaction.execute("DELETE FROM remote_nodes WHERE mirror = ?1", [&sync.name])?;
         transaction.execute(
@@ -414,7 +426,34 @@ pub(crate) fn replace_remote_snapshot(
             snapshot.cursor
         ],
     )?;
+    clear_remote_scan(&transaction, mirror)?;
     transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn remote_scan(connection: &Connection, mirror: &str) -> Result<Option<RemoteScan>> {
+    metadata_value(connection, &format!("remote-scan:{mirror}"))?
+        .map(|value| serde_json::from_str(&value).context("failed to read unfinished remote scan"))
+        .transpose()
+}
+
+pub(crate) fn save_remote_scan(
+    connection: &Connection,
+    mirror: &str,
+    scan: &RemoteScan,
+) -> Result<()> {
+    set_metadata(
+        connection,
+        &format!("remote-scan:{mirror}"),
+        &serde_json::to_string(scan)?,
+    )
+}
+
+pub(crate) fn clear_remote_scan(connection: &Connection, mirror: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM metadata WHERE key = ?1",
+        [format!("remote-scan:{mirror}")],
+    )?;
     Ok(())
 }
 

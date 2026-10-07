@@ -8,7 +8,6 @@ import { createInterface } from 'node:readline';
 import { Database } from 'bun:sqlite';
 
 import { CryptoProxy } from '@protontech/crypto';
-import { Api as CryptoApi } from '@protontech/crypto/proxy/endpoint/api.ts';
 import {
     DriveEventType,
     FeatureFlags,
@@ -28,6 +27,7 @@ import { getOrGenerateClientUid } from './clientUid';
 import { getConfig } from './config';
 import { initCredentials } from './credentials';
 import { NoEventsProvider } from './events/providerNoEvents';
+import { LifetimeCryptoApi } from './key-lifetime';
 
 declare const APP_VERSION: string;
 declare const SDK_VERSION: string;
@@ -80,8 +80,8 @@ async function init() {
         mkdir(sdkCacheDir, { recursive: true, mode: 0o700 }),
         mkdir(sdkAppDir, { recursive: true, mode: 0o700 }),
     ]);
-    CryptoApi.init({});
-    CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
+    LifetimeCryptoApi.init({});
+    CryptoProxy.setEndpoint(new LifetimeCryptoApi(), (endpoint) => endpoint.clearKeyStore());
     const { auth, addresses, srp, httpClient } = await initApi(config, credentials, logger, CryptoProxy);
     if (!auth.isLoggedIn()) {
         throw new Error('Log in with proton-drive before syncing');

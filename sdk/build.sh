@@ -46,6 +46,7 @@ if [ ! -f "$source_dir/cli/bun.lock" ]; then
 fi
 
 cp "$root/sdk/pdrive-sync-sdk.ts" "$source_dir/cli/src/pdrive-sync-sdk.ts"
+cp "$root/sdk/key-lifetime.ts" "$source_dir/cli/src/key-lifetime.ts"
 dependencies="$root/target/sdk-build-dependencies"
 mkdir -p "$dependencies"
 cp "$root/sdk/build-dependencies/package.json" "$root/sdk/build-dependencies/bun.lock" "$dependencies/"

@@ -56,8 +56,6 @@ pdrive-sync restart --init dinit
 pdrive-sync uninstall --init dinit
 ```
 
-The systemd unit also applies a soft `MemoryHigh=512M` cache-reclaim boundary.
-
 ## Configuration
 
 The default file is `~/.config/pdrive-sync/config.toml`:
