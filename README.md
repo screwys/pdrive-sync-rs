@@ -97,26 +97,14 @@ cargo build --locked
 ```
 ## Behavior
 
-Remote discovery uses node IDs. The first run inventories the included remote
-folders; later runs read SDK events from a saved cursor and update that inventory.
-The inventory and cursor commit together. A server refresh request or changed
-exclusions causes a new inventory. Excluded folders are skipped during traversal.
+The first run inventories the included remote folders; later runs read SDK events from a saved cursor and update that inventory.
 
-Push checks local metadata and the last accepted remote checksum. Changed files
-upload in bounded batches. The SDK hashes and encrypts their content and skips
-files that already match. Its upload receipts supply the accepted checksum and
-revision without another Rust hashing pass. Successful items are checkpointed
-even when other items in the same batch fail. Cleanup starts after all uploads
-succeed, and push checks the local file list again before cleanup after uploads.
+The SDK hashes and encrypts their content and skips files that already match. Cleanup starts after all uploads succeed, and push checks the local file list again before cleanup after uploads.
 
 Two-way sync hashes changed local files and compares both sides with the last
 successful checkpoint. The helper checks remote revisions before writes, and
 the service checks for local edits before downloads replace a file or local
-files move to Trash. Downloads verify their size and SHA-1 while the SDK writes
-the staged content, then move into place.
-
-Runs using the same state database wait for each other. State records the local
-and remote roots so changing a configured destination starts a new baseline.
+files move to Trash. 
 
 Symlinks and non-UTF-8 names are skipped or rejected. Empty directories are not reproduced.
 
